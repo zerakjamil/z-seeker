@@ -1,0 +1,7 @@
+/target
+
+# Database and Secrets
+.env
+lancedb/
+data/
+

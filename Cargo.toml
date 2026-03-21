@@ -1,0 +1,27 @@
+[package]
+name = "copilot-mcp-search"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+tokio = { version = "1.36", features = ["full"] }
+notify = "6.1"
+ignore = "0.4"
+walkdir = "2.4"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+reqwest = { version = "0.11", features = ["json", "rustls-tls"] }
+anyhow = "1.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+dotenv = "0.15"
+tree-sitter-rust = "0.24.1"
+tree-sitter-typescript = "0.23.2"
+tree-sitter = "0.26.7"
+lancedb = "0.14"
+arrow-array = "53.0"
+arrow-schema = "53.0"
+futures = "0.3.32"
+
+[build-dependencies]
+cc = "1.0"
