@@ -48,6 +48,43 @@ pub fn install_to_vscode() -> Result<()> {
         .context("Invalid characters in executable path")?
         .to_string();
 
+    // We should install to BOTH settings.json and the new mcp.json standard
+
+    let mcp_json_path = settings_path.parent().unwrap().join("mcp.json");
+    if mcp_json_path.exists() {
+        let mcp_content = fs::read_to_string(&mcp_json_path).unwrap_or_else(|_| "{}".to_string());
+        let mut mcp_config: serde_json::Value = serde_json::from_str(&mcp_content).unwrap_or_else(|_| serde_json::json!({}));
+        
+        let mcp_obj = mcp_config.as_object_mut().unwrap();
+        if !mcp_obj.contains_key("servers") {
+            mcp_obj.insert("servers".to_string(), serde_json::json!({}));
+        }
+
+        let servers = mcp_obj.get_mut("servers").unwrap().as_object_mut().unwrap();
+        servers.insert(
+            "Z-Seeker".to_string(),
+            serde_json::json!({
+                "command": &current_exe,
+                "args": []
+            })
+        );
+        fs::write(&mcp_json_path, serde_json::to_string_pretty(&mcp_config)?)?;
+        println!("✅ Injected into global mcp.json at: {}", mcp_json_path.display());
+    } else {
+        // Create mcp.json if it doesn't exist
+        let mcp_config = serde_json::json!({
+            "servers": {
+                "Z-Seeker": {
+                    "command": &current_exe,
+                    "args": []
+                }
+            }
+        });
+        fs::write(&mcp_json_path, serde_json::to_string_pretty(&mcp_config)?)?;
+        println!("✅ Created and injected into mcp.json at: {}", mcp_json_path.display());
+    }
+
+    // Now do the Copilot settings.json
     let settings_content = fs::read_to_string(&settings_path)?;
     let mut config: serde_json::Value = serde_json::from_str(&settings_content).unwrap_or_else(|_| serde_json::json!({}));
 
