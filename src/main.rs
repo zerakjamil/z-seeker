@@ -125,6 +125,21 @@ async fn setup_core() -> Result<(Arc<CopilotProvider>, Arc<VectorDb>)> {
     Ok((provider, db))
 }
 
+fn is_ignored_path(path: &std::path::Path) -> bool {
+    let ignored_components = [
+        "node_modules", "vendor", ".git", "target", "dist", "build", "out", ".next", ".lancedb"
+    ];
+    
+    for comp in path.components() {
+        if let Some(comp_str) = comp.as_os_str().to_str() {
+            if ignored_components.contains(&comp_str) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 fn start_background_processor(
     provider: Arc<CopilotProvider>,
     db: Arc<VectorDb>,
@@ -136,7 +151,7 @@ fn start_background_processor(
         
         while let Some(event) = rx.recv().await {
             for path in event.paths {
-                if !path.is_file() || path.starts_with(".git") || path.starts_with("target") {
+                if !path.is_file() || is_ignored_path(&path) {
                     continue;
                 }
                 
@@ -165,17 +180,23 @@ fn start_background_processor(
                     info!("File changed: {} ({} chunks extracted)", path.display(), chunks.len());
                 }
 
+                let mut chunks_buffer = Vec::new();
+
                 for chunk in chunks {
                     match provider.get_embeddings(&chunk.content).await {
                         Ok(embedding) => {
-                            info!("Adding chunk from {} to VectorDb", chunk.file_path);
-                            if let Err(e) = db.add_chunk(chunk, embedding).await {
-                                error!("Failed to add chunk to db: {}", e);
-                            }
+                            chunks_buffer.push((chunk, embedding));
                         },
                         Err(e) => {
                             error!("Copilot API Embedding error: {}", e);
                         }
+                    }
+                }
+                
+                if !chunks_buffer.is_empty() {
+                    info!("Adding {} chunks to VectorDb", chunks_buffer.len());
+                    if let Err(e) = db.add_chunks(chunks_buffer).await {
+                        error!("Failed to add chunks to db: {}", e);
                     }
                 }
             }
@@ -196,6 +217,7 @@ async fn initial_index(
     
     let mut count = 0;
     let mut parser = CodeParser::new();
+    let mut batch_buffer = Vec::new();
 
     for result in builder.build() {
         if count >= config.max_file_count {
@@ -209,7 +231,7 @@ async fn initial_index(
         };
 
         let path = entry.path();
-        if !path.is_file() {
+        if !path.is_file() || is_ignored_path(path) {
             continue;
         }
         
@@ -241,8 +263,25 @@ async fn initial_index(
 
         for chunk in chunks {
             if let Ok(embedding) = provider.get_embeddings(&chunk.content).await {
-                let _ = db.add_chunk(chunk, embedding).await;
+                batch_buffer.push((chunk, embedding));
             }
+        }
+        
+        // Insert in batches of 200 chunks to avoid LanceDB version bloat
+        if batch_buffer.len() >= 200 {
+            info!("Writing batch of {} chunks to vector database...", batch_buffer.len());
+            let batch = std::mem::take(&mut batch_buffer);
+            if let Err(e) = db.add_chunks(batch).await {
+                error!("Failed to add chunks: {}", e);
+            }
+        }
+    }
+    
+    // Flush remaining
+    if !batch_buffer.is_empty() {
+        info!("Writing final batch of {} chunks to vector database...", batch_buffer.len());
+        if let Err(e) = db.add_chunks(batch_buffer).await {
+            error!("Failed to add chunks: {}", e);
         }
     }
 

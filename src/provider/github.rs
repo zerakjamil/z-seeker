@@ -27,7 +27,7 @@ struct CopilotInternalTokenResponse {
 
 #[derive(Serialize, Deserialize, Debug)]
 pub struct EmbeddingsRequest {
-    pub input: String,
+    pub input: Vec<String>,
     pub model: String,
 }
 
@@ -102,7 +102,7 @@ impl CopilotProvider {
         let session_token = self.get_valid_session_token().await?;
 
         let req_body = EmbeddingsRequest {
-            input: text.to_string(),
+            input: vec![text.to_string()],
             model: "text-embedding-3-small".to_string(), // Typical dense model size 1536
         };
 

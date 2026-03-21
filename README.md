@@ -6,6 +6,21 @@ It actively watches your workspace files, parses them using `tree-sitter`, gener
 
 ## ✨ Features
 
+### Side-by-side Comparison
+
+See the difference in context awareness when giving an AI standard file access vs enabling semantic reasoning powered by `z-seeker`:
+
+<table>
+  <tr>
+    <th width="50%">Before Z-Seeker (No Context)</th>
+    <th width="50%">After Z-Seeker (Semantic Search via MCP)</th>
+  </tr>
+  <tr>
+    <td><img src="assets/before-zseeker.png" alt="Before Z-Seeker - Hallucinated response or fallback" width="100%"/></td>
+    <td><img src="assets/after-zseeker.png" alt="After Z-Seeker - Exact method references and instant codebase understanding" width="100%"/></td>
+  </tr>
+</table>
+
 - **Real-Time Indexing**: Runs a background `tokio` watcher that automatically detects file changes and re-indexes code chunks on the fly.
 - **AST-Aware Chunking**: Leverages `tree-sitter` (Rust, TypeScript/JavaScript) to smartly chunk your code by logical blocks rather than arbitrary line breaks.
 - **Local Vector Database**: Uses `LanceDB` directly on your disk (`.lancedb/`) for sub-millisecond similarity search—no external database setup required.
@@ -87,9 +102,9 @@ If you are using GitHub Copilot inside VS Code, you can add this MCP server dire
 ```json
 {
   "github.copilot.mcp.localServers": {
-    "local-semantic-search": {
-      "command": "/absolute/path/to/z-seeker/target/release/z-seeker",
-      "args": []
+    "zseek-mcp": {
+      "command": "zseek",
+      "args": ["mcp"]
     }
   }
 }

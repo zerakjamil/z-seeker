@@ -45,6 +45,47 @@ impl VectorDb {
         Ok(Self { table })
     }
 
+    pub async fn add_chunks(&self, data: Vec<(Chunk, Vec<f32>)>) -> Result<()> {
+        if data.is_empty() { return Ok(()); }
+        let schema = self.table.schema().await?;
+
+        let mut file_paths = Vec::with_capacity(data.len());
+        let mut contents = Vec::with_capacity(data.len());
+        let mut start_lines = Vec::with_capacity(data.len());
+        let mut end_lines = Vec::with_capacity(data.len());
+        let mut vectors = Vec::with_capacity(data.len());
+
+        for (chunk, embedding) in data {
+            file_paths.push(chunk.file_path);
+            contents.push(chunk.content);
+            start_lines.push(chunk.start_line as i32);
+            end_lines.push(chunk.end_line as i32);
+            vectors.push(Some(embedding.into_iter().map(Some).collect::<Vec<_>>()));
+        }
+
+        let file_path_array = StringArray::from(file_paths);
+        let content_array = StringArray::from(contents);
+        let start_line_array = Int32Array::from(start_lines);
+        let end_line_array = Int32Array::from(end_lines);
+        let vector_array = FixedSizeListArray::from_iter_primitive::<Float32Type, _, _>(vectors, 1536);
+
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(file_path_array) as Arc<dyn arrow_array::Array>,
+                Arc::new(content_array) as Arc<dyn arrow_array::Array>,
+                Arc::new(start_line_array) as Arc<dyn arrow_array::Array>,
+                Arc::new(end_line_array) as Arc<dyn arrow_array::Array>,
+                Arc::new(vector_array) as Arc<dyn arrow_array::Array>,
+            ],
+        )?;
+
+        let batches = vec![Ok(batch)];
+        let iter = RecordBatchIterator::new(batches.into_iter(), schema.clone());
+        self.table.add(iter).execute().await?;
+        Ok(())
+    }
+
     pub async fn add_chunk(&self, chunk: Chunk, embedding: Vec<f32>) -> Result<()> {
         let schema = self.table.schema().await?;
 

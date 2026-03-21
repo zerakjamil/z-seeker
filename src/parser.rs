@@ -26,6 +26,8 @@ impl CodeParser {
         let language = match ext {
             "rs" => tree_sitter_rust::LANGUAGE.into(),
             "ts" | "tsx" => tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
+            "js" | "jsx" => tree_sitter_javascript::LANGUAGE.into(),
+            "php" => tree_sitter_php::LANGUAGE_PHP.into(),
             _ => return Err(anyhow!("Unsupported language extension: {}", ext)),
         };
 

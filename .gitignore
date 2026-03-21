@@ -5,3 +5,5 @@
 lancedb/
 data/
 
+test_db
+test_db_read

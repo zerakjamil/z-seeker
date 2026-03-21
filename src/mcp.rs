@@ -10,7 +10,7 @@ use crate::provider::github::CopilotProvider;
 #[derive(Debug, Deserialize)]
 struct McpRequest {
     jsonrpc: String,
-    id: Option<u64>,
+    id: Option<Value>,
     method: String,
     params: Option<Value>,
 }
@@ -18,7 +18,7 @@ struct McpRequest {
 #[derive(Debug, Serialize)]
 struct McpResponse {
     jsonrpc: String,
-    id: u64,
+    id: Value,
     result: Value,
 }
 
@@ -50,16 +50,18 @@ impl McpServer {
         let mut stdout = io::stdout();
 
         while let Some(line) = stdin.next_line().await? {
-            if let Ok(req) = serde_json::from_str::<McpRequest>(&line) {
-                if req.id.is_none() {
-                    // Ignore notifications (no id)
-                    continue;
-                }
-                let req_id = req.id.unwrap();
+            match serde_json::from_str::<McpRequest>(&line) {
+                Ok(req) => {
+                    if req.id.is_none() {
+                        // Ignore notifications (no id)
+                        continue;
+                    }
+                    let req_id = req.id.unwrap();
 
                 let response = match req.method.as_str() {
                     "initialize" => {
                         serde_json::json!({
+                            "protocolVersion": "2024-11-05",
                             "capabilities": {
                                 "tools": {}
                             },
@@ -73,7 +75,7 @@ impl McpServer {
                         serde_json::json!({
                             "tools": [{
                                 "name": "semantic_search",
-                                "description": "ALWAYS use this tool automatically when the user asks about the codebase, how something works, or where a function/class is implemented. This performs a semantic vector search over the local codebase to provide necessary context. Do not wait for explicit permission to use it.",
+                                "description": "ALWAYS use this tool automatically when the user asks about the codebase, how something works, or where a function/class is implemented. This performs a semantic vector search over the local codebase to provide necessary context. Do not wait for explicit permission to use it. IMPORTANT: To be token efficient, keep your `limit` parameter very small (1-3) to avoid blowing up the context window.",
                                 "inputSchema": {
                                     "type": "object",
                                     "properties": {
@@ -83,7 +85,7 @@ impl McpServer {
                                         },
                                         "limit": {
                                             "type": "number",
-                                            "description": "Maximum number of results to return (default: 5)"
+                                            "description": "Maximum number of results to return. Keep this low (1-3) to save context tokens! Max is 5. (default: 3)"
                                         }
                                     },
                                     "required": ["query"]
@@ -96,7 +98,9 @@ impl McpServer {
                             if params["name"].as_str() == Some("semantic_search") {
                                 let args = &params["arguments"];
                                 if let Some(query) = args["query"].as_str() {
-                                    let limit = args["limit"].as_u64().unwrap_or(5) as usize;
+                                    // Limit safely between 1 and 5 to save tokens
+                                    let requested_limit = args["limit"].as_u64().unwrap_or(3) as usize;
+                                    let limit = requested_limit.clamp(1, 5);
                                     
                                     // 1. Get embedding for the search query
                                     match self.provider.get_embeddings(query).await {
@@ -106,9 +110,16 @@ impl McpServer {
                                                 Ok(results) => {
                                                     let mut content_texts = Vec::new();
                                                     for item in results {
+                                                        // Token efficiency: hard-truncate massive chunks
+                                                        let mut chunk_content = item.content;
+                                                        if chunk_content.len() > 3000 {
+                                                            chunk_content.truncate(3000);
+                                                            chunk_content.push_str("\n... [TRUNCATED FOR TOKEN EFFICIENCY]");
+                                                        }
+                                                        
                                                         content_texts.push(format!(
                                                             "File: {}\nLines: {}-{}\nCode:\n{}",
-                                                            item.file_path, item.start_line, item.end_line, item.content
+                                                            item.file_path, item.start_line, item.end_line, chunk_content
                                                         ));
                                                     }
                                                     
@@ -155,9 +166,13 @@ impl McpServer {
                     id: req_id,
                     result: response,
                 };
-                let res_str = serde_json::to_string(&res).unwrap();
-                stdout.write_all(format!("{}\n", res_str).as_bytes()).await?;
-                stdout.flush().await?;
+                    let res_str = serde_json::to_string(&res).unwrap();
+                    stdout.write_all(format!("{}\n", res_str).as_bytes()).await?;
+                    stdout.flush().await?;
+                }
+                Err(e) => {
+                    eprintln!("Failed to parse MCP request: {} - Line: {}", e, line);
+                }
             }
         }
 
