@@ -106,17 +106,22 @@ zseek watch --max-file-count 2000
 Because this server implements the Model Context Protocol over standard input/output (STDIO), you can configure your AI assistant to spawn it as a child process.
 
 ### Option A: VS Code (GitHub Copilot)
-If you are using GitHub Copilot inside VS Code, you can add this MCP server directly to your workspace or user settings.
+If you are using GitHub Copilot inside VS Code, you can dramatically simplify installation by running the automatic installer hook:
 
-1. Open your VS Code Settings (JSON). (`Cmd + Shift + P` -> "Preferences: Open Settings (JSON)")
-2. Add the following configuration mapping:
+```bash
+zseek install
+```
+
+This will automatically find your VS Code `settings.json` and map the Z-Seeker executable into your MCP ecosystem.
+
+Alternatively, you can add it manually mapping this into your VS Code Settings (JSON):
 
 ```json
 {
-  "github.copilot.mcp.localServers": {
-    "zseek-mcp": {
+  "github.copilot.chat.mcp.servers": {
+    "Z-Seeker Search": {
       "command": "zseek",
-      "args": ["mcp"]
+      "args": []
     }
   }
 }

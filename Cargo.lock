@@ -6676,6 +6676,7 @@ dependencies = [
  "arrow-schema",
  "cc",
  "clap",
+ "dirs",
  "dotenv",
  "futures",
  "ignore",

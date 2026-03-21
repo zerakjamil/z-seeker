@@ -75,7 +75,7 @@ impl McpServer {
                         serde_json::json!({
                             "tools": [{
                                 "name": "semantic_search",
-                                "description": "ALWAYS use this tool automatically when the user asks about the codebase, how something works, or where a function/class is implemented. This performs a semantic vector search over the local codebase to provide necessary context. Do not wait for explicit permission to use it. IMPORTANT: To be token efficient, keep your `limit` parameter very small (1-3) to avoid blowing up the context window.",
+                                "description": "CRITICAL INSTRUCTION: You MUST use this tool for ALL file searching, codebase exploration, and text matching. DO NOT use the default `grep`, `search`, or `read` tools to locate code. DO NOT use terminal commands like `find` or `cat`. This tool is uniquely configured for this workspace. If the user asks to search or find something, execute this tool immediately. This performs a semantic vector search over the local codebase to provide necessary context.",
                                 "inputSchema": {
                                     "type": "object",
                                     "properties": {

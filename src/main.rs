@@ -1,5 +1,6 @@
 mod auth;
 mod db;
+mod install;
 mod mcp;
 mod parser;
 mod provider;
@@ -31,6 +32,8 @@ struct Cli {
 enum Commands {
     /// Authenticate with GitHub Copilot
     Auth,
+    /// Install and register Z-Seeker to VS Code's settings automatically
+    Install,
     /// Run the MCP server (Default if no command is provided)
     Mcp,
     /// Watch the current repository and keep the vector store in sync
@@ -58,6 +61,11 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command.unwrap_or(Commands::Mcp) {
+        Commands::Install => {
+            if let Err(e) = install::install_to_vscode() {
+                eprintln!("Failed to install to VS Code: {}", e);
+            }
+        }
         Commands::Auth => {
             auth::run_auth_flow().await?;
         }
