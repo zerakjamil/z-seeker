@@ -1,10 +1,18 @@
 <div align="center">
-  <img src="assets/zseeker-logo.png" alt="Z-Seeker Logo" width="250"/>
+  <img src="assets/zseeker-logo.png" alt="Z-Seeker Logo" width="280"/>
+  
+  <h1>🚀 Z-Seeker</h1>
+  
+  <p><strong>A blistering fast, local Model Context Protocol (MCP) server that provides semantic search capabilities over your codebase.</strong></p>
+
+  <p>
+    <a href="https://github.com/zerakjamil/z-seeker/blob/main/LICENSE"><img src="https://img.shields.io/badge/License-MIT-blue.svg" alt="License"></a>
+    <a href="https://rust-lang.org"><img src="https://img.shields.io/badge/Built_with-Rust-orange.svg?logo=rust" alt="Built with Rust"></a>
+    <a href="https://modelcontextprotocol.io/"><img src="https://img.shields.io/badge/MCP-Ready-success.svg?logo=gnometerminal&logoColor=white" alt="MCP Ready"></a>
+  </p>
 </div>
 
-# 🚀 Z-Seeker MCP Server
-
-A blistering fast, local Model Context Protocol (MCP) server that provides semantic search capabilities over your codebase. 
+<br/>
 
 It actively watches your workspace files, parses them using `tree-sitter`, generates embeddings via the **GitHub Copilot API**, and indexes them in a local **LanceDB** vector database. By exposing a standard MCP `"semantic_search"` tool, it allows any compatible LLM client to mathematically search and understand your local code architecture.
 
