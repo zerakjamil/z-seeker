@@ -1,3 +1,7 @@
+<div align="center">
+  <img src="assets/zseeker-logo.png" alt="Z-Seeker Logo" width="250"/>
+</div>
+
 # 🚀 Z-Seeker MCP Server
 
 A blistering fast, local Model Context Protocol (MCP) server that provides semantic search capabilities over your codebase. 
