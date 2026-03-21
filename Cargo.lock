@@ -1062,31 +1062,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "copilot-mcp-search"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "arrow-array",
- "arrow-schema",
- "cc",
- "dotenv",
- "futures",
- "ignore",
- "lancedb",
- "notify",
- "reqwest 0.11.27",
- "serde",
- "serde_json",
- "tokio",
- "tracing",
- "tracing-subscriber",
- "tree-sitter",
- "tree-sitter-rust",
- "tree-sitter-typescript",
- "walkdir",
-]
-
-[[package]]
 name = "core-foundation"
 version = "0.9.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6470,6 +6445,31 @@ dependencies = [
  "quote",
  "syn 2.0.117",
  "synstructure",
+]
+
+[[package]]
+name = "z-seeker"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "arrow-array",
+ "arrow-schema",
+ "cc",
+ "dotenv",
+ "futures",
+ "ignore",
+ "lancedb",
+ "notify",
+ "reqwest 0.11.27",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "tree-sitter",
+ "tree-sitter-rust",
+ "tree-sitter-typescript",
+ "walkdir",
 ]
 
 [[package]]

@@ -1,4 +1,4 @@
-# 🚀 Local Semantic Search MCP Server
+# 🚀 Z-Seeker MCP Server
 
 A blistering fast, local Model Context Protocol (MCP) server that provides semantic search capabilities over your codebase. 
 
@@ -22,8 +22,8 @@ It actively watches your workspace files, parses them using `tree-sitter`, gener
 
 1. **Clone the repository:**
    ```bash
-   git clone https://github.com/yourusername/copilot-mcp-search.git
-   cd copilot-mcp-search
+   git clone https://github.com/zerakjamil/z-seeker.git
+   cd z-seeker
    ```
 
 2. **Build the Project:**
@@ -34,7 +34,7 @@ It actively watches your workspace files, parses them using `tree-sitter`, gener
 3. **Authenticate:**
    You must authorize the app securely with your GitHub account so it can fetch embeddings.
    ```bash
-   ./target/release/copilot-mcp-search auth
+   ./target/release/z-seeker auth
    ```
    Follow the on-screen instructions to paste your code at `https://github.com/login/device`. Your token will be securely saved to `~/.copilot-mcp-token`.
 
@@ -52,7 +52,7 @@ If you are using GitHub Copilot inside VS Code, you can add this MCP server dire
 {
   "github.copilot.mcp.localServers": {
     "local-semantic-search": {
-      "command": "/absolute/path/to/copilot-mcp-search/target/release/copilot-mcp-search",
+      "command": "/absolute/path/to/z-seeker/target/release/z-seeker",
       "args": []
     }
   }
@@ -67,7 +67,7 @@ Add the following to your MCP client's configuration file (e.g., `claude_desktop
 {
   "mcpServers": {
     "local-semantic-search": {
-      "command": "/absolute/path/to/copilot-mcp-search/target/release/copilot-mcp-search",
+      "command": "/absolute/path/to/z-seeker/target/release/z-seeker",
       "args": []
     }
   }

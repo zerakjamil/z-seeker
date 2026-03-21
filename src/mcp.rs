@@ -64,7 +64,7 @@ impl McpServer {
                                 "tools": {}
                             },
                             "serverInfo": {
-                                "name": "local-semantic-search",
+                                "name": "z-seeker",
                                 "version": "0.1.0"
                             }
                         })
