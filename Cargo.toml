@@ -1,5 +1,5 @@
 [package]
-name = "z-seeker"
+name = "zseek"
 version = "0.1.0"
 edition = "2021"
 
@@ -22,6 +22,7 @@ lancedb = "0.14"
 arrow-array = "53.0"
 arrow-schema = "53.0"
 futures = "0.3.32"
+clap = { version = "4.6.0", features = ["derive"] }
 
 [build-dependencies]
 cc = "1.0"

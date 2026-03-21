@@ -11,22 +11,10 @@ It actively watches your workspace files, parses them using `tree-sitter`, gener
 - **Local Vector Database**: Uses `LanceDB` directly on your disk (`.lancedb/`) for sub-millisecond similarity search—no external database setup required.
 - **MCP Compliant**: Communicates via standard STDIO JSON-RPC. Easily pluggable into Copilot, Cursor, Claude Desktop, and other MCP-compatible clients.
 
-## ✨ Why Z-Seeker? (With vs. Without)
-
-**Without Z-Seeker ❌**
-> **You:** "Where is our database authentication handled?"
-> **Copilot:** "I don't have enough context to answer that. Please open the relevant file."
-> *(You spend 5 minutes `grep`-ing for 'database', 'auth', 'login', only to realize the previous developer named the file `postgres_connector.rs`)*.
-
-**With Z-Seeker ✅**
-> **You:** "Where is our database authentication handled?"
-> **Copilot (using Z-Seeker):** "I found it in `postgres_connector.rs:45-92`."
-> *(Z-Seeker acts as an autonomous brain, vector-searching your entire project in the background and handing Copilot the exact lines of code it needs before answering).*
-
-## 🧠 Token Efficiency & Usage Rates
+## Token Efficiency & Usage Rates
 
 Z-Seeker is designed to be **hyper-efficient** with your GitHub Copilot quota:
-- **No Chat Overload**: Without Z-Seeker, developers often paste hundreds to thousands of lines of irrelevant code into the chat window just to provide context. Z-Seeker uses AST-aware parsing (`tree-sitter`) to return *only* the specific structs and functions relevant to your query.
+- **No Chat Overload**: Z-Seeker uses AST-aware parsing (`tree-sitter`) to return *only* the specific structs and functions relevant to your query.
 - **Cheap Embeddings**: Indexing your files relies on the `embeddings` endpoint, which is orders of magnitude faster and cheaper than standard chat token generation. Once a file is indexed, it is cached locally in LanceDB. Z-Seeker only reaches out for a new embedding if you **save** an active modification to a file. 
 - **Zero-Waste Queries**: When you ask a question, Z-Seeker only performs inference on your 1-sentence question to match it against your local database!
 
@@ -56,6 +44,35 @@ Z-Seeker is designed to be **hyper-efficient** with your GitHub Copilot quota:
    ./target/release/z-seeker auth
    ```
    Follow the on-screen instructions to paste your code at `https://github.com/login/device`. Your token will be securely saved to `~/.copilot-mcp-token`.
+
+## ⌨️ CLI Usage
+
+Z-Seeker comes with a built-in CLI to manually manage background syncing and index configuration. It functions seamlessly as your personal, unlimited semantic grep tool.
+
+Install it globally using `cargo install`:
+
+```bash
+cargo install --path .
+```
+
+Then you can use the `zseek` command anywhere:
+
+```bash
+# Start the MCP server (Default behavior)
+zseek
+
+# Authenticate with GitHub Copilot
+zseek auth
+
+# Index the current repository and keep the local LanceDB store in sync via file watchers
+zseek watch
+
+# Limit uploads/indexing to files under a specific size (in bytes, default is 5MB)
+zseek watch --max-file-size 5242880
+
+# Limit the indexing to a specific number of files (default is 2000) to prevent exhausting embeddings
+zseek watch --max-file-count 2000
+```
 
 ## 🔌 Hooking it up to an MCP Client
 

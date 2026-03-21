@@ -7,8 +7,8 @@ use std::path::PathBuf;
 use std::time::Duration;
 use tokio::time::sleep;
 
-// You can replace this with your own GitHub OAuth App Client ID
-const CLIENT_ID: &str = "01ab8ac9400c4e429b23"; // GitHub CLI Client ID as an example
+// We use the GitHub Copilot Plugin Client ID so it doesn't frighten the user with "repo" read/write scopes.
+const CLIENT_ID: &str = "Iv1.b507a08c87ecfe98"; 
 
 #[derive(Debug, Deserialize)]
 struct DeviceCodeResponse {
@@ -47,7 +47,7 @@ pub async fn run_auth_flow() -> Result<()> {
     let res = client
         .post("https://github.com/login/device/code")
         .header("Accept", "application/json")
-        .query(&[("client_id", CLIENT_ID), ("scope", "repo user")])
+        .query(&[("client_id", CLIENT_ID), ("scope", "read:user")])
         .send()
         .await?;
 
