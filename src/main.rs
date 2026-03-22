@@ -72,7 +72,7 @@ async fn main() -> Result<()> {
         Commands::Mcp => {
             info!("Starting Local Semantic Search MCP Server...");
             let (provider, db) = setup_core().await?;
-            
+
             // Also start background watcher for MCP with defaults, or we can choose to rely on manual sync
             // We'll keep it as default for now
             let (tx, mut rx) = mpsc::channel(100);
@@ -84,7 +84,10 @@ async fn main() -> Result<()> {
             let mcp_server = McpServer::new(provider, db);
             mcp_server.run().await?;
         }
-        Commands::Watch { max_file_size, max_file_count } => {
+        Commands::Watch {
+            max_file_size,
+            max_file_count,
+        } => {
             info!("Starting file watcher and indexing...");
             let (provider, db) = setup_core().await?;
             let current_dir = env::current_dir()?;
@@ -95,12 +98,15 @@ async fn main() -> Result<()> {
             };
 
             // Initiate the initial index (placeholder - we can add actual walkdir later)
-            info!("Performing initial index of up to {} files, size limit {} bytes...", max_file_count, max_file_size);
+            info!(
+                "Performing initial index of up to {} files, size limit {} bytes...",
+                max_file_count, max_file_size
+            );
             initial_index(&current_dir, &provider, &db, &config).await?;
 
             let (tx, mut rx) = mpsc::channel(100);
             let _watcher = FileWatcher::new(&current_dir, tx, config.clone())?;
-            
+
             start_background_processor(provider.clone(), db.clone(), rx, config);
 
             // Block forever on the watcher
@@ -114,15 +120,14 @@ async fn main() -> Result<()> {
 }
 
 async fn setup_core() -> Result<(Arc<CopilotProvider>, Arc<VectorDb>)> {
-    let token = env::var("COPILOT_API_KEY").unwrap_or_else(|_| {
-        crate::auth::load_saved_token().unwrap_or_default()
-    });
+    let token = env::var("COPILOT_API_KEY")
+        .unwrap_or_else(|_| crate::auth::load_saved_token().unwrap_or_default());
 
     if token.is_empty() {
         eprintln!("Authentication required! Run `zseek auth` in your terminal first.");
         std::process::exit(1);
     }
-    
+
     let provider = Arc::new(CopilotProvider::new(token.clone()));
 
     let current_dir = env::current_dir()?;
@@ -135,9 +140,17 @@ async fn setup_core() -> Result<(Arc<CopilotProvider>, Arc<VectorDb>)> {
 
 fn is_ignored_path(path: &std::path::Path) -> bool {
     let ignored_components = [
-        "node_modules", "vendor", ".git", "target", "dist", "build", "out", ".next", ".lancedb"
+        "node_modules",
+        "vendor",
+        ".git",
+        "target",
+        "dist",
+        "build",
+        "out",
+        ".next",
+        ".lancedb",
     ];
-    
+
     for comp in path.components() {
         if let Some(comp_str) = comp.as_os_str().to_str() {
             if ignored_components.contains(&comp_str) {
@@ -156,17 +169,21 @@ fn start_background_processor(
 ) {
     tokio::spawn(async move {
         let mut parser = CodeParser::new();
-        
+
         while let Some(event) = rx.recv().await {
             for path in event.paths {
                 if !path.is_file() || is_ignored_path(&path) {
                     continue;
                 }
-                
+
                 // Enforce max file size
                 if let Ok(metadata) = tokio::fs::metadata(&path).await {
                     if metadata.len() > config.max_file_size {
-                        info!("Skipping large file: {} ({} bytes)", path.display(), metadata.len());
+                        info!(
+                            "Skipping large file: {} ({} bytes)",
+                            path.display(),
+                            metadata.len()
+                        );
                         continue;
                     }
                 }
@@ -179,13 +196,17 @@ fn start_background_processor(
                 let chunks = match parser.parse_file(&path, &content) {
                     Ok(c) => c,
                     Err(e) => {
-                        error!("Failed to parse {}: {}", path.display(), e);
+                        tracing::debug!("Failed to parse {}: {}", path.display(), e);
                         continue;
                     }
                 };
-                
+
                 if !chunks.is_empty() {
-                    info!("File changed: {} ({} chunks extracted)", path.display(), chunks.len());
+                    info!(
+                        "File changed: {} ({} chunks extracted)",
+                        path.display(),
+                        chunks.len()
+                    );
                 }
 
                 let mut chunks_buffer = Vec::new();
@@ -194,13 +215,13 @@ fn start_background_processor(
                     match provider.get_embeddings(&chunk.content).await {
                         Ok(embedding) => {
                             chunks_buffer.push((chunk, embedding));
-                        },
+                        }
                         Err(e) => {
                             error!("Copilot API Embedding error: {}", e);
                         }
                     }
                 }
-                
+
                 if !chunks_buffer.is_empty() {
                     info!("Adding {} chunks to VectorDb", chunks_buffer.len());
                     if let Err(e) = db.add_chunks(chunks_buffer).await {
@@ -222,7 +243,7 @@ async fn initial_index(
     use ignore::WalkBuilder;
     let mut builder = WalkBuilder::new(dir);
     builder.hidden(true).git_ignore(true);
-    
+
     let mut count = 0;
     let mut parser = CodeParser::new();
     let mut batch_buffer = Vec::new();
@@ -242,7 +263,7 @@ async fn initial_index(
         if !path.is_file() || is_ignored_path(path) {
             continue;
         }
-        
+
         let metadata = match entry.metadata() {
             Ok(m) => m,
             Err(_) => continue,
@@ -267,27 +288,38 @@ async fn initial_index(
         }
 
         count += 1;
-        info!("Indexing file {}/{}: {}", count, config.max_file_count, path.display());
+        info!(
+            "Indexing file {}/{}: {}",
+            count,
+            config.max_file_count,
+            path.display()
+        );
 
         for chunk in chunks {
             if let Ok(embedding) = provider.get_embeddings(&chunk.content).await {
                 batch_buffer.push((chunk, embedding));
             }
         }
-        
+
         // Insert in batches of 200 chunks to avoid LanceDB version bloat
         if batch_buffer.len() >= 200 {
-            info!("Writing batch of {} chunks to vector database...", batch_buffer.len());
+            info!(
+                "Writing batch of {} chunks to vector database...",
+                batch_buffer.len()
+            );
             let batch = std::mem::take(&mut batch_buffer);
             if let Err(e) = db.add_chunks(batch).await {
                 error!("Failed to add chunks: {}", e);
             }
         }
     }
-    
+
     // Flush remaining
     if !batch_buffer.is_empty() {
-        info!("Writing final batch of {} chunks to vector database...", batch_buffer.len());
+        info!(
+            "Writing final batch of {} chunks to vector database...",
+            batch_buffer.len()
+        );
         if let Err(e) = db.add_chunks(batch_buffer).await {
             error!("Failed to add chunks: {}", e);
         }

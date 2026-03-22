@@ -24,7 +24,11 @@ impl Default for WatchConfig {
 }
 
 impl FileWatcher {
-    pub fn new<P: AsRef<Path>>(watch_path: P, tx: mpsc::Sender<Event>, config: WatchConfig) -> Result<Self> {
+    pub fn new<P: AsRef<Path>>(
+        watch_path: P,
+        tx: mpsc::Sender<Event>,
+        config: WatchConfig,
+    ) -> Result<Self> {
         let watch_path = watch_path.as_ref().to_path_buf();
         let mut _watcher = RecommendedWatcher::new(
             move |res: notify::Result<Event>| {
@@ -42,7 +46,10 @@ impl FileWatcher {
 
         _watcher.watch(&watch_path, RecursiveMode::Recursive)?;
         info!("Started watching directory: {:?}", watch_path);
-        info!("Watch config: max_file_size={}, max_file_count={}", config.max_file_size, config.max_file_count);
+        info!(
+            "Watch config: max_file_size={}, max_file_count={}",
+            config.max_file_size, config.max_file_count
+        );
 
         Ok(Self { _watcher })
     }

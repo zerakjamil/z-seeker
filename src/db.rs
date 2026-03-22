@@ -1,13 +1,13 @@
-use std::sync::Arc;
+use crate::parser::Chunk;
 use anyhow::{Context, Result};
 use arrow_array::types::Float32Type;
-use arrow_array::{FixedSizeListArray, Int32Array, RecordBatch, StringArray, RecordBatchIterator};
+use arrow_array::{FixedSizeListArray, Int32Array, RecordBatch, RecordBatchIterator, StringArray};
 use arrow_schema::{DataType, Field, Schema as ArrowSchema};
+use futures::StreamExt;
 use lancedb::connection::Connection;
 use lancedb::{connect, Table};
+use std::sync::Arc;
 use tracing::info;
-use futures::StreamExt;
-use crate::parser::Chunk;
 
 use lancedb::query::{ExecutableQuery, QueryBase};
 pub struct VectorDb {
@@ -38,7 +38,9 @@ impl VectorDb {
             Ok(t) => t,
             Err(_) => {
                 info!("Creating LanceDB table '{}' at {}", table_name, uri);
-                conn.create_empty_table(table_name, schema).execute().await?
+                conn.create_empty_table(table_name, schema)
+                    .execute()
+                    .await?
             }
         };
 
@@ -46,7 +48,9 @@ impl VectorDb {
     }
 
     pub async fn add_chunks(&self, data: Vec<(Chunk, Vec<f32>)>) -> Result<()> {
-        if data.is_empty() { return Ok(()); }
+        if data.is_empty() {
+            return Ok(());
+        }
         let schema = self.table.schema().await?;
 
         let mut file_paths = Vec::with_capacity(data.len());
@@ -67,7 +71,8 @@ impl VectorDb {
         let content_array = StringArray::from(contents);
         let start_line_array = Int32Array::from(start_lines);
         let end_line_array = Int32Array::from(end_lines);
-        let vector_array = FixedSizeListArray::from_iter_primitive::<Float32Type, _, _>(vectors, 1536);
+        let vector_array =
+            FixedSizeListArray::from_iter_primitive::<Float32Type, _, _>(vectors, 1536);
 
         let batch = RecordBatch::try_new(
             schema.clone(),
@@ -95,9 +100,7 @@ impl VectorDb {
         let end_line_array = Int32Array::from(vec![chunk.end_line as i32]);
 
         let vector_array = FixedSizeListArray::from_iter_primitive::<Float32Type, _, _>(
-            vec![Some(
-                embedding.into_iter().map(Some).collect::<Vec<_>>(),
-            )],
+            vec![Some(embedding.into_iter().map(Some).collect::<Vec<_>>())],
             1536,
         );
 
@@ -119,7 +122,11 @@ impl VectorDb {
         Ok(())
     }
 
-    pub async fn search(&self, query_embedding: Vec<f32>, limit_count: usize) -> Result<Vec<Chunk>> {
+    pub async fn search(
+        &self,
+        query_embedding: Vec<f32>,
+        limit_count: usize,
+    ) -> Result<Vec<Chunk>> {
         let qs = query_embedding.as_slice();
         let mut results = self
             .table
@@ -130,15 +137,33 @@ impl VectorDb {
             .await?;
 
         let mut chunks = Vec::new();
-        
+
         while let Some(batch_res) = results.next().await {
             let batch = batch_res?;
-            if batch.num_rows() == 0 { continue; }
+            if batch.num_rows() == 0 {
+                continue;
+            }
 
-            let file_paths = batch.column(0).as_any().downcast_ref::<StringArray>().unwrap();
-            let contents = batch.column(1).as_any().downcast_ref::<StringArray>().unwrap();
-            let start_lines = batch.column(2).as_any().downcast_ref::<Int32Array>().unwrap();
-            let end_lines = batch.column(3).as_any().downcast_ref::<Int32Array>().unwrap();
+            let file_paths = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            let contents = batch
+                .column(1)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            let start_lines = batch
+                .column(2)
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap();
+            let end_lines = batch
+                .column(3)
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap();
 
             for i in 0..batch.num_rows() {
                 chunks.push(Chunk {

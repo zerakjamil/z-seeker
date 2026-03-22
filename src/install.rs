@@ -5,7 +5,7 @@ use std::path::PathBuf;
 pub fn install_to_vscode() -> Result<()> {
     // Determine the VS Code user settings path
     let home = dirs::home_dir().context("Could not find home directory")?;
-    
+
     let settings_paths = vec![
         // Mac
         home.join("Library/Application Support/Code/User/settings.json"),
@@ -38,7 +38,8 @@ pub fn install_to_vscode() -> Result<()> {
             } else {
                 None
             }
-        }.context("Could not find VS Code settings.json. Ensure VS Code is installed.")?
+        }
+        .context("Could not find VS Code settings.json. Ensure VS Code is installed.")?,
     };
 
     println!("Found VS Code settings at: {}", settings_path.display());
@@ -53,8 +54,9 @@ pub fn install_to_vscode() -> Result<()> {
     let mcp_json_path = settings_path.parent().unwrap().join("mcp.json");
     if mcp_json_path.exists() {
         let mcp_content = fs::read_to_string(&mcp_json_path).unwrap_or_else(|_| "{}".to_string());
-        let mut mcp_config: serde_json::Value = serde_json::from_str(&mcp_content).unwrap_or_else(|_| serde_json::json!({}));
-        
+        let mut mcp_config: serde_json::Value =
+            serde_json::from_str(&mcp_content).unwrap_or_else(|_| serde_json::json!({}));
+
         let mcp_obj = mcp_config.as_object_mut().unwrap();
         if !mcp_obj.contains_key("servers") {
             mcp_obj.insert("servers".to_string(), serde_json::json!({}));
@@ -66,10 +68,13 @@ pub fn install_to_vscode() -> Result<()> {
             serde_json::json!({
                 "command": &current_exe,
                 "args": []
-            })
+            }),
         );
         fs::write(&mcp_json_path, serde_json::to_string_pretty(&mcp_config)?)?;
-        println!("✅ Injected into global mcp.json at: {}", mcp_json_path.display());
+        println!(
+            "✅ Injected into global mcp.json at: {}",
+            mcp_json_path.display()
+        );
     } else {
         // Create mcp.json if it doesn't exist
         let mcp_config = serde_json::json!({
@@ -81,16 +86,20 @@ pub fn install_to_vscode() -> Result<()> {
             }
         });
         fs::write(&mcp_json_path, serde_json::to_string_pretty(&mcp_config)?)?;
-        println!("✅ Created and injected into mcp.json at: {}", mcp_json_path.display());
+        println!(
+            "✅ Created and injected into mcp.json at: {}",
+            mcp_json_path.display()
+        );
     }
 
     // Now do the Copilot settings.json
     let settings_content = fs::read_to_string(&settings_path)?;
-    let mut config: serde_json::Value = serde_json::from_str(&settings_content).unwrap_or_else(|_| serde_json::json!({}));
+    let mut config: serde_json::Value =
+        serde_json::from_str(&settings_content).unwrap_or_else(|_| serde_json::json!({}));
 
     // Ensure the github.copilot.chat.mcp.servers object exists
     let mcp_key = "github.copilot.chat.mcp.servers";
-    
+
     if !config.is_object() {
         config = serde_json::json!({});
     }
@@ -100,7 +109,11 @@ pub fn install_to_vscode() -> Result<()> {
         config_obj.insert(mcp_key.to_string(), serde_json::json!({}));
     }
 
-    let mcp_servers = config_obj.get_mut(mcp_key).unwrap().as_object_mut().unwrap();
+    let mcp_servers = config_obj
+        .get_mut(mcp_key)
+        .unwrap()
+        .as_object_mut()
+        .unwrap();
 
     // Insert Z-Seeker
     mcp_servers.insert(
@@ -108,7 +121,7 @@ pub fn install_to_vscode() -> Result<()> {
         serde_json::json!({
             "command": current_exe,
             "args": []
-        })
+        }),
     );
 
     // Save back to settings.json

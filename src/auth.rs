@@ -8,7 +8,7 @@ use std::time::Duration;
 use tokio::time::sleep;
 
 // We use the GitHub Copilot Plugin Client ID so it doesn't frighten the user with "repo" read/write scopes.
-const CLIENT_ID: &str = "Iv1.b507a08c87ecfe98"; 
+const CLIENT_ID: &str = "Iv1.b507a08c87ecfe98";
 
 #[derive(Debug, Deserialize)]
 struct DeviceCodeResponse {
@@ -100,7 +100,9 @@ pub async fn run_auth_flow() -> Result<()> {
                     interval += 5;
                 }
                 "expired_token" => {
-                    return Err(anyhow!("The device code has expired. Please run auth again."));
+                    return Err(anyhow!(
+                        "The device code has expired. Please run auth again."
+                    ));
                 }
                 "access_denied" => {
                     return Err(anyhow!("Authorization was denied."));

@@ -2,8 +2,8 @@ use anyhow::{Context, Result};
 use reqwest::{Client, StatusCode};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use tokio::sync::RwLock;
 use std::time::{SystemTime, UNIX_EPOCH};
+use tokio::sync::RwLock;
 
 #[derive(Clone, Debug)]
 pub struct CopilotProvider {
@@ -65,7 +65,8 @@ impl CopilotProvider {
         }
 
         // Token is missing or expired, fetch a new one
-        let resp = self.client
+        let resp = self
+            .client
             .get("https://api.github.com/copilot_internal/v2/token")
             .header("Authorization", format!("token {}", self.oauth_token))
             .header("Editor-Version", "vscode/1.85.0")
@@ -78,7 +79,11 @@ impl CopilotProvider {
         if !resp.status().is_success() {
             let status = resp.status();
             let err_text = resp.text().await.unwrap_or_default();
-            return Err(anyhow::anyhow!("Failed to exchange Copilot token {}: {}", status, err_text));
+            return Err(anyhow::anyhow!(
+                "Failed to exchange Copilot token {}: {}",
+                status,
+                err_text
+            ));
         }
 
         let token_resp: CopilotInternalTokenResponse = resp.json().await?;
@@ -107,7 +112,8 @@ impl CopilotProvider {
         };
 
         // Notice we use the standard Copilot telemetry proxy which requires Editor-Version
-        let resp = self.client
+        let resp = self
+            .client
             .post("https://api.individual.githubcopilot.com/embeddings")
             .header("Authorization", format!("Bearer {}", session_token))
             .header("Editor-Version", "vscode/1.85.0")
@@ -121,7 +127,7 @@ impl CopilotProvider {
         if !resp.status().is_success() {
             let status = resp.status();
             let err_text = resp.text().await.unwrap_or_default();
-            
+
             // If the session token is rejected, force flush the cache so it retries next time
             if status == StatusCode::UNAUTHORIZED || status == StatusCode::FORBIDDEN {
                 let mut cache = self.session_token.write().await;
@@ -133,7 +139,8 @@ impl CopilotProvider {
 
         let resp_json = resp.json::<EmbeddingsResponse>().await?;
 
-        resp_json.data
+        resp_json
+            .data
             .into_iter()
             .next()
             .map(|d| d.embedding)
