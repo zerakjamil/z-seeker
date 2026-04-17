@@ -1,10 +1,12 @@
-use crate::parser::Chunk;
-use anyhow::{Context, Result};
+use crate::parser::{content_hash_for_text, Chunk};
+use anyhow::{anyhow, Result};
 use arrow_array::types::Float32Type;
-use arrow_array::{FixedSizeListArray, Int32Array, RecordBatch, RecordBatchIterator, StringArray};
+use arrow_array::{
+    Array, FixedSizeListArray, Float32Array, Float64Array, Int32Array, RecordBatch,
+    RecordBatchIterator, StringArray,
+};
 use arrow_schema::{DataType, Field, Schema as ArrowSchema};
 use futures::StreamExt;
-use lancedb::connection::Connection;
 use lancedb::{connect, Table};
 use std::sync::Arc;
 use tracing::info;
@@ -12,6 +14,12 @@ use tracing::info;
 use lancedb::query::{ExecutableQuery, QueryBase};
 pub struct VectorDb {
     table: Table,
+}
+
+#[derive(Debug, Clone)]
+pub struct SearchResult {
+    pub chunk: Chunk,
+    pub distance: Option<f32>,
 }
 
 impl VectorDb {
@@ -23,6 +31,10 @@ impl VectorDb {
             Field::new("content", DataType::Utf8, false),
             Field::new("start_line", DataType::Int32, false),
             Field::new("end_line", DataType::Int32, false),
+            Field::new("language", DataType::Utf8, false),
+            Field::new("symbol_name", DataType::Utf8, true),
+            Field::new("symbol_kind", DataType::Utf8, true),
+            Field::new("content_hash", DataType::Utf8, false),
             Field::new(
                 "vector",
                 DataType::FixedSizeList(
@@ -52,11 +64,19 @@ impl VectorDb {
             return Ok(());
         }
         let schema = self.table.schema().await?;
+        let has_metadata_columns = schema.index_of("language").is_ok()
+            && schema.index_of("symbol_name").is_ok()
+            && schema.index_of("symbol_kind").is_ok()
+            && schema.index_of("content_hash").is_ok();
 
         let mut file_paths = Vec::with_capacity(data.len());
         let mut contents = Vec::with_capacity(data.len());
         let mut start_lines = Vec::with_capacity(data.len());
         let mut end_lines = Vec::with_capacity(data.len());
+        let mut languages = Vec::with_capacity(data.len());
+        let mut symbol_names = Vec::with_capacity(data.len());
+        let mut symbol_kinds = Vec::with_capacity(data.len());
+        let mut content_hashes = Vec::with_capacity(data.len());
         let mut vectors = Vec::with_capacity(data.len());
 
         for (chunk, embedding) in data {
@@ -64,6 +84,10 @@ impl VectorDb {
             contents.push(chunk.content);
             start_lines.push(chunk.start_line as i32);
             end_lines.push(chunk.end_line as i32);
+            languages.push(chunk.language);
+            symbol_names.push(chunk.symbol_name);
+            symbol_kinds.push(chunk.symbol_kind);
+            content_hashes.push(chunk.content_hash);
             vectors.push(Some(embedding.into_iter().map(Some).collect::<Vec<_>>()));
         }
 
@@ -71,19 +95,40 @@ impl VectorDb {
         let content_array = StringArray::from(contents);
         let start_line_array = Int32Array::from(start_lines);
         let end_line_array = Int32Array::from(end_lines);
+        let language_array = StringArray::from(languages);
+        let symbol_name_array = StringArray::from(symbol_names);
+        let symbol_kind_array = StringArray::from(symbol_kinds);
+        let content_hash_array = StringArray::from(content_hashes);
         let vector_array =
             FixedSizeListArray::from_iter_primitive::<Float32Type, _, _>(vectors, 1536);
 
-        let batch = RecordBatch::try_new(
-            schema.clone(),
-            vec![
-                Arc::new(file_path_array) as Arc<dyn arrow_array::Array>,
-                Arc::new(content_array) as Arc<dyn arrow_array::Array>,
-                Arc::new(start_line_array) as Arc<dyn arrow_array::Array>,
-                Arc::new(end_line_array) as Arc<dyn arrow_array::Array>,
-                Arc::new(vector_array) as Arc<dyn arrow_array::Array>,
-            ],
-        )?;
+        let batch = if has_metadata_columns {
+            RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(file_path_array) as Arc<dyn arrow_array::Array>,
+                    Arc::new(content_array) as Arc<dyn arrow_array::Array>,
+                    Arc::new(start_line_array) as Arc<dyn arrow_array::Array>,
+                    Arc::new(end_line_array) as Arc<dyn arrow_array::Array>,
+                    Arc::new(language_array) as Arc<dyn arrow_array::Array>,
+                    Arc::new(symbol_name_array) as Arc<dyn arrow_array::Array>,
+                    Arc::new(symbol_kind_array) as Arc<dyn arrow_array::Array>,
+                    Arc::new(content_hash_array) as Arc<dyn arrow_array::Array>,
+                    Arc::new(vector_array) as Arc<dyn arrow_array::Array>,
+                ],
+            )?
+        } else {
+            RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(file_path_array) as Arc<dyn arrow_array::Array>,
+                    Arc::new(content_array) as Arc<dyn arrow_array::Array>,
+                    Arc::new(start_line_array) as Arc<dyn arrow_array::Array>,
+                    Arc::new(end_line_array) as Arc<dyn arrow_array::Array>,
+                    Arc::new(vector_array) as Arc<dyn arrow_array::Array>,
+                ],
+            )?
+        };
 
         let batches = vec![Ok(batch)];
         let iter = RecordBatchIterator::new(batches.into_iter(), schema.clone());
@@ -93,27 +138,52 @@ impl VectorDb {
 
     pub async fn add_chunk(&self, chunk: Chunk, embedding: Vec<f32>) -> Result<()> {
         let schema = self.table.schema().await?;
+        let has_metadata_columns = schema.index_of("language").is_ok()
+            && schema.index_of("symbol_name").is_ok()
+            && schema.index_of("symbol_kind").is_ok()
+            && schema.index_of("content_hash").is_ok();
 
         let file_path_array = StringArray::from(vec![chunk.file_path.clone()]);
         let content_array = StringArray::from(vec![chunk.content.clone()]);
         let start_line_array = Int32Array::from(vec![chunk.start_line as i32]);
         let end_line_array = Int32Array::from(vec![chunk.end_line as i32]);
+        let language_array = StringArray::from(vec![chunk.language.clone()]);
+        let symbol_name_array = StringArray::from(vec![chunk.symbol_name.clone()]);
+        let symbol_kind_array = StringArray::from(vec![chunk.symbol_kind.clone()]);
+        let content_hash_array = StringArray::from(vec![chunk.content_hash.clone()]);
 
         let vector_array = FixedSizeListArray::from_iter_primitive::<Float32Type, _, _>(
             vec![Some(embedding.into_iter().map(Some).collect::<Vec<_>>())],
             1536,
         );
 
-        let batch = RecordBatch::try_new(
-            schema.clone(),
-            vec![
-                Arc::new(file_path_array) as Arc<dyn arrow_array::Array>,
-                Arc::new(content_array) as Arc<dyn arrow_array::Array>,
-                Arc::new(start_line_array) as Arc<dyn arrow_array::Array>,
-                Arc::new(end_line_array) as Arc<dyn arrow_array::Array>,
-                Arc::new(vector_array) as Arc<dyn arrow_array::Array>,
-            ],
-        )?;
+        let batch = if has_metadata_columns {
+            RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(file_path_array) as Arc<dyn arrow_array::Array>,
+                    Arc::new(content_array) as Arc<dyn arrow_array::Array>,
+                    Arc::new(start_line_array) as Arc<dyn arrow_array::Array>,
+                    Arc::new(end_line_array) as Arc<dyn arrow_array::Array>,
+                    Arc::new(language_array) as Arc<dyn arrow_array::Array>,
+                    Arc::new(symbol_name_array) as Arc<dyn arrow_array::Array>,
+                    Arc::new(symbol_kind_array) as Arc<dyn arrow_array::Array>,
+                    Arc::new(content_hash_array) as Arc<dyn arrow_array::Array>,
+                    Arc::new(vector_array) as Arc<dyn arrow_array::Array>,
+                ],
+            )?
+        } else {
+            RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(file_path_array) as Arc<dyn arrow_array::Array>,
+                    Arc::new(content_array) as Arc<dyn arrow_array::Array>,
+                    Arc::new(start_line_array) as Arc<dyn arrow_array::Array>,
+                    Arc::new(end_line_array) as Arc<dyn arrow_array::Array>,
+                    Arc::new(vector_array) as Arc<dyn arrow_array::Array>,
+                ],
+            )?
+        };
 
         // LanceDB 0.14 IntoArrow is implemented for RecordBatchIterator directly
         let batches = vec![Ok(batch)];
@@ -126,7 +196,7 @@ impl VectorDb {
         &self,
         query_embedding: Vec<f32>,
         limit_count: usize,
-    ) -> Result<Vec<Chunk>> {
+    ) -> Result<Vec<SearchResult>> {
         let qs = query_embedding.as_slice();
         let mut results = self
             .table
@@ -144,33 +214,141 @@ impl VectorDb {
                 continue;
             }
 
+            let schema = batch.schema();
+            let file_path_idx = schema
+                .index_of("file_path")
+                .map_err(|_| anyhow!("Missing file_path column in search results"))?;
+            let content_idx = schema
+                .index_of("content")
+                .map_err(|_| anyhow!("Missing content column in search results"))?;
+            let start_line_idx = schema
+                .index_of("start_line")
+                .map_err(|_| anyhow!("Missing start_line column in search results"))?;
+            let end_line_idx = schema
+                .index_of("end_line")
+                .map_err(|_| anyhow!("Missing end_line column in search results"))?;
+            let language_idx = schema.index_of("language").ok();
+            let symbol_name_idx = schema.index_of("symbol_name").ok();
+            let symbol_kind_idx = schema.index_of("symbol_kind").ok();
+            let content_hash_idx = schema.index_of("content_hash").ok();
+            let distance_idx = schema.index_of("_distance").ok();
+
             let file_paths = batch
-                .column(0)
+                .column(file_path_idx)
                 .as_any()
                 .downcast_ref::<StringArray>()
-                .unwrap();
+                .ok_or_else(|| anyhow!("file_path column has unexpected type"))?;
             let contents = batch
-                .column(1)
+                .column(content_idx)
                 .as_any()
                 .downcast_ref::<StringArray>()
-                .unwrap();
+                .ok_or_else(|| anyhow!("content column has unexpected type"))?;
             let start_lines = batch
-                .column(2)
+                .column(start_line_idx)
                 .as_any()
                 .downcast_ref::<Int32Array>()
-                .unwrap();
+                .ok_or_else(|| anyhow!("start_line column has unexpected type"))?;
             let end_lines = batch
-                .column(3)
+                .column(end_line_idx)
                 .as_any()
                 .downcast_ref::<Int32Array>()
-                .unwrap();
+                .ok_or_else(|| anyhow!("end_line column has unexpected type"))?;
+
+            let language_values = language_idx.and_then(|idx| {
+                batch
+                    .column(idx)
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+            });
+            let symbol_name_values = symbol_name_idx.and_then(|idx| {
+                batch
+                    .column(idx)
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+            });
+            let symbol_kind_values = symbol_kind_idx.and_then(|idx| {
+                batch
+                    .column(idx)
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+            });
+            let content_hash_values = content_hash_idx.and_then(|idx| {
+                batch
+                    .column(idx)
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+            });
 
             for i in 0..batch.num_rows() {
-                chunks.push(Chunk {
-                    file_path: file_paths.value(i).to_string(),
-                    content: contents.value(i).to_string(),
-                    start_line: start_lines.value(i) as usize,
-                    end_line: end_lines.value(i) as usize,
+                let language = language_values
+                    .map(|values| {
+                        if values.is_null(i) {
+                            "unknown".to_string()
+                        } else {
+                            values.value(i).to_string()
+                        }
+                    })
+                    .unwrap_or_else(|| "unknown".to_string());
+
+                let symbol_name = symbol_name_values.and_then(|values| {
+                    if values.is_null(i) {
+                        None
+                    } else {
+                        Some(values.value(i).to_string())
+                    }
+                });
+
+                let symbol_kind = symbol_kind_values.and_then(|values| {
+                    if values.is_null(i) {
+                        None
+                    } else {
+                        Some(values.value(i).to_string())
+                    }
+                });
+
+                let content = contents.value(i).to_string();
+                let content_hash = content_hash_values
+                    .map(|values| {
+                        if values.is_null(i) {
+                            content_hash_for_text(&content)
+                        } else {
+                            values.value(i).to_string()
+                        }
+                    })
+                    .unwrap_or_else(|| content_hash_for_text(&content));
+
+                let distance = distance_idx.and_then(|idx| {
+                    let array = batch.column(idx);
+
+                    if let Some(values) = array.as_any().downcast_ref::<Float32Array>() {
+                        if values.is_null(i) {
+                            None
+                        } else {
+                            Some(values.value(i))
+                        }
+                    } else if let Some(values) = array.as_any().downcast_ref::<Float64Array>() {
+                        if values.is_null(i) {
+                            None
+                        } else {
+                            Some(values.value(i) as f32)
+                        }
+                    } else {
+                        None
+                    }
+                });
+
+                chunks.push(SearchResult {
+                    chunk: Chunk {
+                        file_path: file_paths.value(i).to_string(),
+                        content,
+                        start_line: start_lines.value(i) as usize,
+                        end_line: end_lines.value(i) as usize,
+                        language,
+                        symbol_name,
+                        symbol_kind,
+                        content_hash,
+                    },
+                    distance,
                 });
             }
         }
