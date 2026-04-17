@@ -8,6 +8,10 @@ const MIN_CHUNK_CHARS: usize = 50;
 const MAX_CHUNK_CHARS: usize = 8000;
 const LINE_CHUNK_SIZE: usize = 50;
 const LINE_CHUNK_OVERLAP: usize = 10;
+const MIN_ADAPTIVE_CHUNK_SIZE: usize = 24;
+const MAX_ADAPTIVE_CHUNK_SIZE: usize = 80;
+const MIN_ADAPTIVE_OVERLAP: usize = 6;
+const MAX_ADAPTIVE_OVERLAP: usize = 20;
 
 #[derive(Debug, Clone)]
 pub struct Chunk {
@@ -18,7 +22,27 @@ pub struct Chunk {
     pub language: String,
     pub symbol_name: Option<String>,
     pub symbol_kind: Option<String>,
+    pub signature_fragment: Option<String>,
+    pub visibility: Option<String>,
+    pub arity: Option<i32>,
+    pub doc_comment_proximity: Option<i32>,
     pub content_hash: String,
+}
+
+#[derive(Debug, Clone, Default)]
+struct SymbolMetadata {
+    symbol_name: Option<String>,
+    symbol_kind: Option<String>,
+    signature_fragment: Option<String>,
+    visibility: Option<String>,
+    arity: Option<i32>,
+    doc_comment_proximity: Option<i32>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct LineChunkPlan {
+    chunk_size: usize,
+    overlap: usize,
 }
 
 pub fn content_hash_for_text(content: &str) -> String {
@@ -58,6 +82,7 @@ impl CodeParser {
         };
 
         let mut chunks = Vec::new();
+        let file_lines: Vec<&str> = content.lines().collect();
 
         if let Some(language) = language {
             self.ts.set_language(&language)?;
@@ -96,7 +121,7 @@ impl CodeParser {
                 }
 
                 let text = &content[start_byte..end_byte];
-                let (symbol_name, symbol_kind) = Self::extract_symbol_metadata(node, content);
+                let metadata = Self::extract_symbol_metadata(node, content, &file_lines);
 
                 if text.trim().len() < MIN_CHUNK_CHARS {
                     continue;
@@ -110,8 +135,8 @@ impl CodeParser {
                         text,
                         node.start_position().row + 1,
                         language_label,
-                        symbol_name.clone(),
-                        symbol_kind.clone(),
+                        Some(&metadata),
+                        Some(Self::node_depth(node)),
                     );
                     continue;
                 }
@@ -122,13 +147,25 @@ impl CodeParser {
                     start_line: node.start_position().row + 1,
                     end_line: node.end_position().row + 1,
                     language: language_label.to_string(),
-                    symbol_name,
-                    symbol_kind,
+                    symbol_name: metadata.symbol_name,
+                    symbol_kind: metadata.symbol_kind,
+                    signature_fragment: metadata.signature_fragment,
+                    visibility: metadata.visibility,
+                    arity: metadata.arity,
+                    doc_comment_proximity: metadata.doc_comment_proximity,
                     content_hash: content_hash_for_text(text),
                 });
             }
         } else {
-            Self::append_line_chunks(&mut chunks, &file_path, content, 1, language_label, None, None);
+            Self::append_line_chunks(
+                &mut chunks,
+                &file_path,
+                content,
+                1,
+                language_label,
+                None,
+                None,
+            );
         }
 
         Ok(chunks)
@@ -175,12 +212,134 @@ impl CodeParser {
     fn extract_symbol_metadata(
         node: tree_sitter::Node<'_>,
         content: &str,
-    ) -> (Option<String>, Option<String>) {
+        lines: &[&str],
+    ) -> SymbolMetadata {
         let symbol_kind = Self::map_symbol_kind(node);
         let symbol_name = Self::extract_identifier_from_node(node, content)
             .or_else(|| Self::extract_identifier_from_first_line(node, content));
 
-        (symbol_name, symbol_kind)
+        let declaration_text = content
+            .get(node.start_byte()..node.end_byte())
+            .unwrap_or_default();
+
+        let signature_fragment = Self::signature_fragment(declaration_text);
+        let visibility = signature_fragment
+            .as_deref()
+            .and_then(Self::extract_visibility);
+        let arity = signature_fragment
+            .as_deref()
+            .and_then(Self::extract_arity);
+        let start_line = node.start_position().row + 1;
+        let doc_comment_proximity = Self::doc_comment_proximity(lines, start_line);
+
+        SymbolMetadata {
+            symbol_name,
+            symbol_kind,
+            signature_fragment,
+            visibility,
+            arity,
+            doc_comment_proximity,
+        }
+    }
+
+    fn signature_fragment(text: &str) -> Option<String> {
+        let line = text
+            .lines()
+            .find(|line| !line.trim().is_empty())?
+            .trim();
+        if line.is_empty() {
+            return None;
+        }
+
+        let compact = line
+            .trim_end_matches('{')
+            .trim_end_matches(';')
+            .trim();
+
+        if compact.is_empty() {
+            None
+        } else {
+            Some(compact.chars().take(220).collect())
+        }
+    }
+
+    fn extract_visibility(signature: &str) -> Option<String> {
+        let normalized = signature.to_ascii_lowercase();
+        if normalized.contains("pub(crate)") || normalized.contains("pub ( crate )") {
+            Some("crate".to_string())
+        } else if normalized.starts_with("pub ")
+            || normalized.starts_with("export ")
+            || normalized.contains(" public ")
+        {
+            Some("public".to_string())
+        } else if normalized.contains(" protected ") {
+            Some("protected".to_string())
+        } else if normalized.contains(" private ") {
+            Some("private".to_string())
+        } else {
+            Some("internal".to_string())
+        }
+    }
+
+    fn extract_arity(signature: &str) -> Option<i32> {
+        let open = signature.find('(')?;
+        let close = signature[open + 1..].find(')')? + open + 1;
+        let params = &signature[open + 1..close];
+        if params.trim().is_empty() {
+            return Some(0);
+        }
+
+        let count = params
+            .split(',')
+            .map(str::trim)
+            .filter(|param| !param.is_empty())
+            .filter(|param| {
+                !matches!(
+                    *param,
+                    "self" | "&self" | "&mut self" | "this" | "cls" | "*args" | "**kwargs"
+                )
+            })
+            .count();
+        Some(count as i32)
+    }
+
+    fn doc_comment_proximity(lines: &[&str], declaration_start_line: usize) -> Option<i32> {
+        if declaration_start_line <= 1 || lines.is_empty() {
+            return None;
+        }
+
+        let mut cursor = declaration_start_line.saturating_sub(1) as i32;
+        let mut scanned = 0usize;
+
+        while cursor > 0 && scanned < 8 {
+            let line = lines
+                .get((cursor - 1) as usize)
+                .map(|line| line.trim())
+                .unwrap_or("");
+
+            if line.is_empty() {
+                cursor -= 1;
+                scanned += 1;
+                continue;
+            }
+
+            let is_doc_line = line.starts_with("///")
+                || line.starts_with("//!")
+                || line.starts_with("/**")
+                || line.starts_with('*')
+                || line.starts_with("##")
+                || line.starts_with("\"\"\"")
+                || line.starts_with("'''");
+
+            if is_doc_line {
+                let proximity = (declaration_start_line as i32 - cursor).max(0);
+                return Some(proximity);
+            }
+
+            break;
+        }
+
+        None
     }
 
     fn map_symbol_kind(node: tree_sitter::Node<'_>) -> Option<String> {
@@ -271,25 +430,150 @@ impl CodeParser {
         None
     }
 
+    fn node_depth(node: tree_sitter::Node<'_>) -> usize {
+        let mut depth = 0usize;
+        let mut current = node.parent();
+
+        while let Some(parent) = current {
+            depth += 1;
+            current = parent.parent();
+        }
+
+        depth
+    }
+
+    fn adaptive_line_chunk_plan(
+        lines: &[&str],
+        metadata: Option<&SymbolMetadata>,
+        node_depth: Option<usize>,
+    ) -> LineChunkPlan {
+        if lines.is_empty() {
+            return LineChunkPlan {
+                chunk_size: LINE_CHUNK_SIZE,
+                overlap: LINE_CHUNK_OVERLAP,
+            };
+        }
+
+        let mut blank_lines = 0usize;
+        let mut non_empty_lines = 0usize;
+        let mut non_empty_chars = 0usize;
+        let mut complexity_tokens = 0usize;
+
+        for line in lines {
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                blank_lines += 1;
+                continue;
+            }
+
+            non_empty_lines += 1;
+            non_empty_chars += trimmed.len();
+
+            complexity_tokens += trimmed.matches('{').count();
+            complexity_tokens += trimmed.matches('}').count();
+            complexity_tokens += trimmed.matches('(').count();
+            complexity_tokens += trimmed.matches(')').count();
+            complexity_tokens += trimmed.matches("=>").count();
+            complexity_tokens += trimmed.matches("::").count();
+
+            for keyword in ["if ", "for ", "while ", "match ", "loop ", "else"] {
+                if trimmed.contains(keyword) {
+                    complexity_tokens += 1;
+                }
+            }
+        }
+
+        let line_count = lines.len();
+        let blank_ratio = blank_lines as f32 / line_count.max(1) as f32;
+        let avg_non_empty_len = if non_empty_lines > 0 {
+            non_empty_chars as f32 / non_empty_lines as f32
+        } else {
+            0.0
+        };
+        let complexity_density = if non_empty_lines > 0 {
+            complexity_tokens as f32 / non_empty_lines as f32
+        } else {
+            0.0
+        };
+
+        let mut target = LINE_CHUNK_SIZE as i32;
+
+        if blank_ratio >= 0.35 && complexity_density <= 1.4 && avg_non_empty_len <= 40.0 {
+            target += 20;
+        }
+
+        if complexity_density >= 3.0 {
+            target -= 14;
+        }
+
+        if avg_non_empty_len >= 90.0 {
+            target -= 8;
+        }
+
+        if let Some(metadata) = metadata {
+            if matches!(
+                metadata.symbol_kind.as_deref(),
+                Some("function") | Some("method") | Some("closure")
+            ) {
+                target -= 4;
+            }
+
+            if metadata.arity.unwrap_or_default() >= 4 {
+                target -= 4;
+            }
+        }
+
+        if let Some(depth) = node_depth {
+            if depth >= 5 {
+                target -= 8;
+            } else if depth >= 3 {
+                target -= 4;
+            }
+        }
+
+        if line_count <= LINE_CHUNK_SIZE {
+            target = target.max(line_count as i32);
+        }
+
+        let chunk_size = target.clamp(
+            MIN_ADAPTIVE_CHUNK_SIZE as i32,
+            MAX_ADAPTIVE_CHUNK_SIZE as i32,
+        ) as usize;
+
+        let mut overlap = ((chunk_size as f32) * 0.2).round() as usize;
+        if blank_ratio >= 0.35 {
+            overlap += 2;
+        }
+
+        overlap = overlap.clamp(MIN_ADAPTIVE_OVERLAP, MAX_ADAPTIVE_OVERLAP);
+        overlap = overlap.min(chunk_size.saturating_sub(1));
+
+        LineChunkPlan {
+            chunk_size,
+            overlap,
+        }
+    }
+
     fn append_line_chunks(
         chunks: &mut Vec<Chunk>,
         file_path: &str,
         text: &str,
         base_start_line: usize,
         language: &str,
-        symbol_name: Option<String>,
-        symbol_kind: Option<String>,
+        metadata: Option<&SymbolMetadata>,
+        node_depth: Option<usize>,
     ) {
         let lines: Vec<&str> = text.lines().collect();
         if lines.is_empty() {
             return;
         }
 
-        let step = LINE_CHUNK_SIZE.saturating_sub(LINE_CHUNK_OVERLAP).max(1);
+        let plan = Self::adaptive_line_chunk_plan(&lines, metadata, node_depth);
+        let step = plan.chunk_size.saturating_sub(plan.overlap).max(1);
         let mut start_idx = 0usize;
 
         while start_idx < lines.len() {
-            let end_idx = (start_idx + LINE_CHUNK_SIZE).min(lines.len());
+            let end_idx = (start_idx + plan.chunk_size).min(lines.len());
             let chunk_lines = &lines[start_idx..end_idx];
             let chunk_text = chunk_lines.join("\n");
 
@@ -300,8 +584,12 @@ impl CodeParser {
                     start_line: base_start_line + start_idx,
                     end_line: base_start_line + end_idx - 1,
                     language: language.to_string(),
-                    symbol_name: symbol_name.clone(),
-                    symbol_kind: symbol_kind.clone(),
+                    symbol_name: metadata.and_then(|m| m.symbol_name.clone()),
+                    symbol_kind: metadata.and_then(|m| m.symbol_kind.clone()),
+                    signature_fragment: metadata.and_then(|m| m.signature_fragment.clone()),
+                    visibility: metadata.and_then(|m| m.visibility.clone()),
+                    arity: metadata.and_then(|m| m.arity),
+                    doc_comment_proximity: metadata.and_then(|m| m.doc_comment_proximity),
                     content_hash: content_hash_for_text(&chunk_lines.join("\n")),
                 });
             }
@@ -402,11 +690,125 @@ impl Demo {
         assert_eq!(first.language, "rust");
         assert_eq!(first.symbol_name.as_deref(), Some("first_method"));
         assert_eq!(first.symbol_kind.as_deref(), Some("method"));
+        assert!(
+            first
+                .signature_fragment
+                .as_deref()
+                .unwrap_or_default()
+                .contains("fn first_method")
+        );
+        assert_eq!(first.visibility.as_deref(), Some("internal"));
+        assert_eq!(first.arity, Some(0));
         assert!(!first.content_hash.is_empty());
 
         assert_eq!(second.language, "rust");
         assert_eq!(second.symbol_name.as_deref(), Some("second_method"));
         assert_eq!(second.symbol_kind.as_deref(), Some("method"));
+        assert_eq!(second.arity, Some(0));
         assert!(!second.content_hash.is_empty());
+    }
+
+    #[test]
+    fn parser_extracts_signature_visibility_and_doc_proximity() {
+        let mut parser = CodeParser::new();
+        let content = r#"
+/// Handles login refresh
+pub fn refresh_token(user: String, token: String) -> bool {
+    !user.is_empty() && !token.is_empty()
+}
+"#;
+
+        let chunks = parser
+            .parse_file(Path::new("auth.rs"), content)
+            .expect("rust code should parse");
+
+        let chunk = chunks
+            .iter()
+            .find(|chunk| chunk.symbol_name.as_deref() == Some("refresh_token"))
+            .expect("refresh_token chunk should exist");
+
+        assert_eq!(chunk.symbol_kind.as_deref(), Some("function"));
+        assert!(
+            chunk
+                .signature_fragment
+                .as_deref()
+                .unwrap_or_default()
+                .contains("pub fn refresh_token")
+        );
+        assert_eq!(chunk.visibility.as_deref(), Some("public"));
+        assert_eq!(chunk.arity, Some(2));
+        assert_eq!(chunk.doc_comment_proximity, Some(1));
+    }
+
+    #[test]
+    fn adaptive_chunking_uses_smaller_windows_for_deep_complex_nodes() {
+        let mut parser = CodeParser::new();
+        let mut lines = vec![
+            "pub fn monster_flow(input: usize) -> usize {".to_string(),
+            "    let mut acc = input;".to_string(),
+        ];
+
+        for idx in 0..260 {
+            lines.push(format!(
+                "    if acc % 2 == 0 {{ acc = acc.wrapping_add({}); }} else {{ acc = acc.wrapping_mul({}); }} // branch {} {}",
+                idx + 3,
+                idx + 5,
+                idx,
+                "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ));
+        }
+
+        lines.push("    acc".to_string());
+        lines.push("}".to_string());
+
+        let content = lines.join("\n");
+        let chunks = parser
+            .parse_file(Path::new("complex.rs"), &content)
+            .expect("complex rust function should parse");
+
+        let monster_chunks = chunks
+            .iter()
+            .filter(|chunk| chunk.symbol_name.as_deref() == Some("monster_flow"))
+            .collect::<Vec<_>>();
+
+        assert!(
+            monster_chunks.len() >= 3,
+            "expected oversized semantic node to be split into multiple chunks"
+        );
+        assert!(
+            monster_chunks
+                .iter()
+                .all(|chunk| (chunk.end_line - chunk.start_line + 1) <= 40),
+            "adaptive chunking should reduce chunk windows for deep and complex nodes"
+        );
+    }
+
+    #[test]
+    fn adaptive_chunking_expands_windows_for_sparse_text() {
+        let mut parser = CodeParser::new();
+        let content = (1..=120)
+            .map(|line| {
+                if line % 2 == 0 {
+                    "".to_string()
+                } else {
+                    format!("note line {:03}", line)
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let chunks = parser
+            .parse_file(Path::new("notes.txt"), &content)
+            .expect("text fallback should parse");
+
+        assert_eq!(
+            chunks.len(),
+            2,
+            "sparse text should use larger chunk windows to improve recall"
+        );
+        assert!(
+            chunks[0].end_line > 50,
+            "first sparse chunk should exceed the fixed 50-line baseline"
+        );
     }
 }

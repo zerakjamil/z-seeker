@@ -34,6 +34,10 @@ impl VectorDb {
             Field::new("language", DataType::Utf8, false),
             Field::new("symbol_name", DataType::Utf8, true),
             Field::new("symbol_kind", DataType::Utf8, true),
+            Field::new("signature_fragment", DataType::Utf8, true),
+            Field::new("visibility", DataType::Utf8, true),
+            Field::new("arity", DataType::Int32, true),
+            Field::new("doc_comment_proximity", DataType::Int32, true),
             Field::new("content_hash", DataType::Utf8, false),
             Field::new(
                 "vector",
@@ -64,10 +68,15 @@ impl VectorDb {
             return Ok(());
         }
         let schema = self.table.schema().await?;
-        let has_metadata_columns = schema.index_of("language").is_ok()
+        let has_core_metadata_columns = schema.index_of("language").is_ok()
             && schema.index_of("symbol_name").is_ok()
             && schema.index_of("symbol_kind").is_ok()
             && schema.index_of("content_hash").is_ok();
+        let has_extended_metadata_columns = has_core_metadata_columns
+            && schema.index_of("signature_fragment").is_ok()
+            && schema.index_of("visibility").is_ok()
+            && schema.index_of("arity").is_ok()
+            && schema.index_of("doc_comment_proximity").is_ok();
 
         let mut file_paths = Vec::with_capacity(data.len());
         let mut contents = Vec::with_capacity(data.len());
@@ -76,6 +85,10 @@ impl VectorDb {
         let mut languages = Vec::with_capacity(data.len());
         let mut symbol_names = Vec::with_capacity(data.len());
         let mut symbol_kinds = Vec::with_capacity(data.len());
+        let mut signature_fragments = Vec::with_capacity(data.len());
+        let mut visibilities = Vec::with_capacity(data.len());
+        let mut arities = Vec::with_capacity(data.len());
+        let mut doc_comment_proximities = Vec::with_capacity(data.len());
         let mut content_hashes = Vec::with_capacity(data.len());
         let mut vectors = Vec::with_capacity(data.len());
 
@@ -87,6 +100,10 @@ impl VectorDb {
             languages.push(chunk.language);
             symbol_names.push(chunk.symbol_name);
             symbol_kinds.push(chunk.symbol_kind);
+            signature_fragments.push(chunk.signature_fragment);
+            visibilities.push(chunk.visibility);
+            arities.push(chunk.arity);
+            doc_comment_proximities.push(chunk.doc_comment_proximity);
             content_hashes.push(chunk.content_hash);
             vectors.push(Some(embedding.into_iter().map(Some).collect::<Vec<_>>()));
         }
@@ -98,11 +115,34 @@ impl VectorDb {
         let language_array = StringArray::from(languages);
         let symbol_name_array = StringArray::from(symbol_names);
         let symbol_kind_array = StringArray::from(symbol_kinds);
+        let signature_fragment_array = StringArray::from(signature_fragments);
+        let visibility_array = StringArray::from(visibilities);
+        let arity_array = Int32Array::from(arities);
+        let doc_comment_proximity_array = Int32Array::from(doc_comment_proximities);
         let content_hash_array = StringArray::from(content_hashes);
         let vector_array =
             FixedSizeListArray::from_iter_primitive::<Float32Type, _, _>(vectors, 1536);
 
-        let batch = if has_metadata_columns {
+        let batch = if has_extended_metadata_columns {
+            RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(file_path_array) as Arc<dyn arrow_array::Array>,
+                    Arc::new(content_array) as Arc<dyn arrow_array::Array>,
+                    Arc::new(start_line_array) as Arc<dyn arrow_array::Array>,
+                    Arc::new(end_line_array) as Arc<dyn arrow_array::Array>,
+                    Arc::new(language_array) as Arc<dyn arrow_array::Array>,
+                    Arc::new(symbol_name_array) as Arc<dyn arrow_array::Array>,
+                    Arc::new(symbol_kind_array) as Arc<dyn arrow_array::Array>,
+                    Arc::new(signature_fragment_array) as Arc<dyn arrow_array::Array>,
+                    Arc::new(visibility_array) as Arc<dyn arrow_array::Array>,
+                    Arc::new(arity_array) as Arc<dyn arrow_array::Array>,
+                    Arc::new(doc_comment_proximity_array) as Arc<dyn arrow_array::Array>,
+                    Arc::new(content_hash_array) as Arc<dyn arrow_array::Array>,
+                    Arc::new(vector_array) as Arc<dyn arrow_array::Array>,
+                ],
+            )?
+        } else if has_core_metadata_columns {
             RecordBatch::try_new(
                 schema.clone(),
                 vec![
@@ -136,12 +176,33 @@ impl VectorDb {
         Ok(())
     }
 
+    pub async fn replace_file_chunks(
+        &self,
+        file_path: &str,
+        data: Vec<(Chunk, Vec<f32>)>,
+    ) -> Result<()> {
+        let escaped_file_path = file_path.replace('\'', "''");
+        let predicate = format!("file_path = '{}'", escaped_file_path);
+        self.table.delete(&predicate).await?;
+
+        if data.is_empty() {
+            return Ok(());
+        }
+
+        self.add_chunks(data).await
+    }
+
     pub async fn add_chunk(&self, chunk: Chunk, embedding: Vec<f32>) -> Result<()> {
         let schema = self.table.schema().await?;
-        let has_metadata_columns = schema.index_of("language").is_ok()
+        let has_core_metadata_columns = schema.index_of("language").is_ok()
             && schema.index_of("symbol_name").is_ok()
             && schema.index_of("symbol_kind").is_ok()
             && schema.index_of("content_hash").is_ok();
+        let has_extended_metadata_columns = has_core_metadata_columns
+            && schema.index_of("signature_fragment").is_ok()
+            && schema.index_of("visibility").is_ok()
+            && schema.index_of("arity").is_ok()
+            && schema.index_of("doc_comment_proximity").is_ok();
 
         let file_path_array = StringArray::from(vec![chunk.file_path.clone()]);
         let content_array = StringArray::from(vec![chunk.content.clone()]);
@@ -150,6 +211,10 @@ impl VectorDb {
         let language_array = StringArray::from(vec![chunk.language.clone()]);
         let symbol_name_array = StringArray::from(vec![chunk.symbol_name.clone()]);
         let symbol_kind_array = StringArray::from(vec![chunk.symbol_kind.clone()]);
+        let signature_fragment_array = StringArray::from(vec![chunk.signature_fragment.clone()]);
+        let visibility_array = StringArray::from(vec![chunk.visibility.clone()]);
+        let arity_array = Int32Array::from(vec![chunk.arity]);
+        let doc_comment_proximity_array = Int32Array::from(vec![chunk.doc_comment_proximity]);
         let content_hash_array = StringArray::from(vec![chunk.content_hash.clone()]);
 
         let vector_array = FixedSizeListArray::from_iter_primitive::<Float32Type, _, _>(
@@ -157,7 +222,26 @@ impl VectorDb {
             1536,
         );
 
-        let batch = if has_metadata_columns {
+        let batch = if has_extended_metadata_columns {
+            RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(file_path_array) as Arc<dyn arrow_array::Array>,
+                    Arc::new(content_array) as Arc<dyn arrow_array::Array>,
+                    Arc::new(start_line_array) as Arc<dyn arrow_array::Array>,
+                    Arc::new(end_line_array) as Arc<dyn arrow_array::Array>,
+                    Arc::new(language_array) as Arc<dyn arrow_array::Array>,
+                    Arc::new(symbol_name_array) as Arc<dyn arrow_array::Array>,
+                    Arc::new(symbol_kind_array) as Arc<dyn arrow_array::Array>,
+                    Arc::new(signature_fragment_array) as Arc<dyn arrow_array::Array>,
+                    Arc::new(visibility_array) as Arc<dyn arrow_array::Array>,
+                    Arc::new(arity_array) as Arc<dyn arrow_array::Array>,
+                    Arc::new(doc_comment_proximity_array) as Arc<dyn arrow_array::Array>,
+                    Arc::new(content_hash_array) as Arc<dyn arrow_array::Array>,
+                    Arc::new(vector_array) as Arc<dyn arrow_array::Array>,
+                ],
+            )?
+        } else if has_core_metadata_columns {
             RecordBatch::try_new(
                 schema.clone(),
                 vec![
@@ -230,6 +314,10 @@ impl VectorDb {
             let language_idx = schema.index_of("language").ok();
             let symbol_name_idx = schema.index_of("symbol_name").ok();
             let symbol_kind_idx = schema.index_of("symbol_kind").ok();
+            let signature_fragment_idx = schema.index_of("signature_fragment").ok();
+            let visibility_idx = schema.index_of("visibility").ok();
+            let arity_idx = schema.index_of("arity").ok();
+            let doc_comment_proximity_idx = schema.index_of("doc_comment_proximity").ok();
             let content_hash_idx = schema.index_of("content_hash").ok();
             let distance_idx = schema.index_of("_distance").ok();
 
@@ -272,6 +360,30 @@ impl VectorDb {
                     .as_any()
                     .downcast_ref::<StringArray>()
             });
+            let signature_fragment_values = signature_fragment_idx.and_then(|idx| {
+                batch
+                    .column(idx)
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+            });
+            let visibility_values = visibility_idx.and_then(|idx| {
+                batch
+                    .column(idx)
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+            });
+            let arity_values = arity_idx.and_then(|idx| {
+                batch
+                    .column(idx)
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+            });
+            let doc_comment_proximity_values = doc_comment_proximity_idx.and_then(|idx| {
+                batch
+                    .column(idx)
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+            });
             let content_hash_values = content_hash_idx.and_then(|idx| {
                 batch
                     .column(idx)
@@ -303,6 +415,38 @@ impl VectorDb {
                         None
                     } else {
                         Some(values.value(i).to_string())
+                    }
+                });
+
+                let signature_fragment = signature_fragment_values.and_then(|values| {
+                    if values.is_null(i) {
+                        None
+                    } else {
+                        Some(values.value(i).to_string())
+                    }
+                });
+
+                let visibility = visibility_values.and_then(|values| {
+                    if values.is_null(i) {
+                        None
+                    } else {
+                        Some(values.value(i).to_string())
+                    }
+                });
+
+                let arity = arity_values.and_then(|values| {
+                    if values.is_null(i) {
+                        None
+                    } else {
+                        Some(values.value(i))
+                    }
+                });
+
+                let doc_comment_proximity = doc_comment_proximity_values.and_then(|values| {
+                    if values.is_null(i) {
+                        None
+                    } else {
+                        Some(values.value(i))
                     }
                 });
 
@@ -346,6 +490,10 @@ impl VectorDb {
                         language,
                         symbol_name,
                         symbol_kind,
+                        signature_fragment,
+                        visibility,
+                        arity,
+                        doc_comment_proximity,
                         content_hash,
                     },
                     distance,
@@ -353,5 +501,89 @@ impl VectorDb {
             }
         }
         Ok(chunks)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::VectorDb;
+    use crate::parser::{content_hash_for_text, Chunk};
+    use anyhow::Result;
+    use std::fs;
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn unique_temp_dir(prefix: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock should be after unix epoch")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("{}-{}", prefix, nanos));
+        fs::create_dir_all(&dir).expect("failed to create temporary test directory");
+        dir
+    }
+
+    fn sample_chunk(file_path: &str, content: &str, start_line: usize, end_line: usize) -> Chunk {
+        Chunk {
+            file_path: file_path.to_string(),
+            content: content.to_string(),
+            start_line,
+            end_line,
+            language: "rust".to_string(),
+            symbol_name: Some("sample_symbol".to_string()),
+            symbol_kind: Some("function".to_string()),
+            signature_fragment: None,
+            visibility: None,
+            arity: None,
+            doc_comment_proximity: None,
+            content_hash: content_hash_for_text(content),
+        }
+    }
+
+    #[tokio::test]
+    async fn replace_file_chunks_replaces_stale_rows_for_same_file() -> Result<()> {
+        let db_dir = unique_temp_dir("zseek-db-upsert");
+        let db = VectorDb::new(db_dir.to_string_lossy().as_ref()).await?;
+        let file_path = "/tmp/project/src/auth.rs";
+
+        let old_chunk = sample_chunk(file_path, "fn old_auth() {}", 1, 5);
+        db.add_chunks(vec![(old_chunk, vec![0.1; 1536])]).await?;
+
+        let new_chunk = sample_chunk(file_path, "fn new_auth() {}", 1, 5);
+        let expected_hash = new_chunk.content_hash.clone();
+        db.replace_file_chunks(file_path, vec![(new_chunk, vec![0.2; 1536])])
+            .await?;
+
+        let results = db.search(vec![0.2; 1536], 20).await?;
+        let same_file = results
+            .iter()
+            .filter(|result| result.chunk.file_path == file_path)
+            .collect::<Vec<_>>();
+
+        assert_eq!(same_file.len(), 1);
+        assert_eq!(same_file[0].chunk.content_hash, expected_hash);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn replace_file_chunks_with_empty_payload_clears_existing_rows() -> Result<()> {
+        let db_dir = unique_temp_dir("zseek-db-clear");
+        let db = VectorDb::new(db_dir.to_string_lossy().as_ref()).await?;
+        let file_path = "/tmp/project/src/stale.rs";
+
+        let chunk = sample_chunk(file_path, "fn stale() {}", 10, 14);
+        db.add_chunks(vec![(chunk, vec![0.3; 1536])]).await?;
+
+        db.replace_file_chunks(file_path, Vec::new()).await?;
+
+        let results = db.search(vec![0.3; 1536], 20).await?;
+        assert!(
+            results
+                .iter()
+                .all(|result| result.chunk.file_path != file_path)
+        );
+
+        Ok(())
     }
 }
