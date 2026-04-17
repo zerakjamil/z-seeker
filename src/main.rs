@@ -193,17 +193,44 @@ async fn main() -> Result<()> {
             log_workspace_roots_for_indexing(&workspace_roots);
 
             let (provider, db) = setup_core().await?;
+            let config = WatchConfig::default();
+
+            let startup_roots = workspace_roots.clone();
+            let startup_provider = provider.clone();
+            let startup_db = db.clone();
+            let startup_config = config.clone();
+            tokio::spawn(async move {
+                info!(
+                    "Starting background initial indexing for MCP (up to {} files per root, size limit {} bytes)...",
+                    startup_config.max_file_count,
+                    startup_config.max_file_size
+                );
+                for root in &startup_roots {
+                    info!("Initial indexing root: {}", root.display());
+                    if let Err(err) =
+                        initial_index(root, &startup_provider, &startup_db, &startup_config).await
+                    {
+                        error!(
+                            "Initial indexing failed for root {}: {}",
+                            root.display(),
+                            err
+                        );
+                    }
+                }
+                info!("Background initial indexing for MCP completed.");
+            });
 
             // Also start background watcher for MCP with defaults, or we can choose to rely on manual sync
             // We'll keep it as default for now
             let (tx, rx) = mpsc::channel(100);
             let mut _watchers = Vec::new();
             for root in &workspace_roots {
-                _watchers.push(FileWatcher::new(root, tx.clone(), WatchConfig::default())?);
+                _watchers.push(FileWatcher::new(root, tx.clone(), config.clone())?);
             }
-            start_background_processor(provider.clone(), db.clone(), rx, WatchConfig::default());
+            start_background_processor(provider.clone(), db.clone(), rx, config);
 
             // Start MCP STDIO server
+            info!("MCP server ready; accepting requests while indexing continues in background.");
             let mcp_server = McpServer::new(provider, db, workspace_roots);
             mcp_server.run().await?;
         }
@@ -220,6 +247,7 @@ async fn main() -> Result<()> {
                 workspace_roots.len(),
                 format_roots(&workspace_roots)
             );
+            log_workspace_roots_for_indexing(&workspace_roots);
 
             let (provider, db) = setup_core().await?;
 

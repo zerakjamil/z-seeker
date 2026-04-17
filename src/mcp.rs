@@ -131,6 +131,7 @@ struct ScoreBreakdown {
     symbol_raw: f32,
     metadata_raw: f32,
     phrase_boost: f32,
+    symbol_specificity_boost: f32,
     weights: RankingWeights,
 }
 
@@ -360,6 +361,8 @@ fn classify_query_intent(query: &str) -> QueryIntent {
             "function",
             "method",
             "class",
+            "model",
+            "models",
             "struct",
             "enum",
             "trait",
@@ -372,22 +375,96 @@ fn classify_query_intent(query: &str) -> QueryIntent {
     QueryIntent::Exploratory
 }
 
+fn is_query_stop_word(token: &str) -> bool {
+    matches!(
+        token,
+        "a"
+            | "an"
+            | "and"
+            | "are"
+            | "as"
+            | "at"
+            | "by"
+            | "for"
+            | "from"
+            | "in"
+            | "into"
+            | "is"
+            | "it"
+            | "of"
+            | "on"
+            | "or"
+            | "that"
+            | "the"
+            | "to"
+            | "with"
+    )
+}
+
+fn split_identifier_fragments(identifier: &str) -> Vec<String> {
+    let chars = identifier.chars().collect::<Vec<_>>();
+    if chars.is_empty() {
+        return Vec::new();
+    }
+
+    let mut fragments = Vec::new();
+    let mut start = 0usize;
+
+    for index in 1..chars.len() {
+        let prev = chars[index - 1];
+        let current = chars[index];
+        let next = chars.get(index + 1).copied();
+
+        let lower_to_upper = prev.is_ascii_lowercase() && current.is_ascii_uppercase();
+        let alpha_to_digit = prev.is_ascii_alphabetic() && current.is_ascii_digit();
+        let digit_to_alpha = prev.is_ascii_digit() && current.is_ascii_alphabetic();
+        let acronym_boundary = prev.is_ascii_uppercase()
+            && current.is_ascii_uppercase()
+            && next.map(|c| c.is_ascii_lowercase()).unwrap_or(false);
+
+        if lower_to_upper || alpha_to_digit || digit_to_alpha || acronym_boundary {
+            let fragment = chars[start..index].iter().collect::<String>();
+            if fragment.len() >= 2 {
+                fragments.push(fragment.to_ascii_lowercase());
+            }
+            start = index;
+        }
+    }
+
+    let tail = chars[start..].iter().collect::<String>();
+    if tail.len() >= 2 {
+        fragments.push(tail.to_ascii_lowercase());
+    }
+
+    fragments
+}
+
 fn tokenize_query(query: &str) -> Vec<String> {
     let mut seen = HashSet::new();
-    query
-        .split(|c: char| !c.is_alphanumeric() && c != '_')
-        .filter_map(|token| {
-            let lowered = token.to_ascii_lowercase();
-            if lowered.len() < 2 {
-                return None;
+    let mut tokens = Vec::new();
+
+    for token in query.split(|c: char| !c.is_alphanumeric() && c != '_') {
+        if token.is_empty() {
+            continue;
+        }
+
+        let lowered = token.to_ascii_lowercase();
+        if lowered.len() >= 2 && !is_query_stop_word(&lowered) && seen.insert(lowered.clone()) {
+            tokens.push(lowered.clone());
+        }
+
+        for fragment in split_identifier_fragments(token) {
+            if is_query_stop_word(&fragment) {
+                continue;
             }
-            if seen.insert(lowered.clone()) {
-                Some(lowered)
-            } else {
-                None
+
+            if seen.insert(fragment.clone()) {
+                tokens.push(fragment);
             }
-        })
-        .collect()
+        }
+    }
+
+    tokens
 }
 
 fn query_term_aliases(term: &str) -> &'static [&'static str] {
@@ -395,13 +472,18 @@ fn query_term_aliases(term: &str) -> &'static [&'static str] {
         "auth" | "authentication" | "authorization" => {
             &["auth", "authentication", "authorization", "login", "session", "token"]
         }
+        "token" | "tokens" => &["token", "tokens", "jwt", "bearer", "sanctum"],
         "db" | "database" => &["db", "database", "sql", "postgres", "sqlite", "mysql"],
         "cfg" | "config" | "configuration" => {
             &["cfg", "config", "configuration", "settings"]
         }
+        "model" | "models" => &["model", "models", "entity", "record"],
+        "sanctum" => &["sanctum", "token", "stateful", "guard", "middleware"],
+        "hasapitokens" => &["hasapitokens", "has", "api", "tokens", "sanctum"],
         "svc" | "service" => &["svc", "service", "handler"],
         "repo" | "repository" => &["repo", "repository", "storage"],
         "api" => &["api", "endpoint", "route", "handler"],
+        "routes" | "route" => &["route", "routes", "endpoint", "api"],
         "init" | "initialize" | "bootstrap" | "setup" => {
             &["init", "initialize", "bootstrap", "setup"]
         }
@@ -447,6 +529,26 @@ fn query_term_matches_symbol(term: &QueryTerm, symbol_name: &str, symbol_tokens:
     })
 }
 
+fn symbol_specificity_boost(query_terms: &[QueryTerm], symbol_name: &str) -> f32 {
+    let strongest_match_len = query_terms
+        .iter()
+        .flat_map(|term| term.variants.iter())
+        .filter(|variant| variant.len() >= 5 && symbol_name.contains(variant.as_str()))
+        .map(|variant| variant.len())
+        .max()
+        .unwrap_or(0);
+
+    if strongest_match_len >= 10 {
+        0.18
+    } else if strongest_match_len >= 7 {
+        0.12
+    } else if strongest_match_len >= 5 {
+        0.08
+    } else {
+        0.0
+    }
+}
+
 fn query_mentions_doc_comments(query_terms: &[QueryTerm]) -> bool {
     query_terms.iter().any(|term| {
         term.variants.iter().any(|variant| {
@@ -489,11 +591,27 @@ fn lexical_match_score(query_terms: &[QueryTerm], chunk: &Chunk) -> (f32, usize)
 }
 
 fn split_symbol_tokens(symbol: &str) -> Vec<String> {
-    symbol
-        .split(|c: char| !c.is_alphanumeric() && c != '_')
-        .map(|part| part.to_ascii_lowercase())
-        .filter(|part| part.len() >= 2)
-        .collect()
+    let mut seen = HashSet::new();
+    let mut tokens = Vec::new();
+
+    for part in symbol.split(|c: char| !c.is_alphanumeric() && c != '_') {
+        if part.is_empty() {
+            continue;
+        }
+
+        let lowered = part.to_ascii_lowercase();
+        if lowered.len() >= 2 && seen.insert(lowered.clone()) {
+            tokens.push(lowered);
+        }
+
+        for fragment in split_identifier_fragments(part) {
+            if seen.insert(fragment.clone()) {
+                tokens.push(fragment);
+            }
+        }
+    }
+
+    tokens
 }
 
 fn metadata_match_score(query_terms: &[QueryTerm], chunk: &Chunk) -> f32 {
@@ -731,11 +849,17 @@ fn rerank_chunks_with_profile(
             0.0
         };
 
+        let symbol_specificity_boost = symbol
+            .as_ref()
+            .map(|name| symbol_specificity_boost(&query_terms, &name.to_ascii_lowercase()))
+            .unwrap_or(0.0);
+
         let score = (vector_rank_score * weights.vector)
             + (lexical_score * weights.lexical)
             + (symbol_score * weights.symbol)
             + (metadata_score * weights.metadata)
-            + phrase_boost;
+            + phrase_boost
+            + symbol_specificity_boost;
 
         let score_breakdown = ScoreBreakdown {
             intent,
@@ -745,6 +869,7 @@ fn rerank_chunks_with_profile(
             symbol_raw: symbol_score,
             metadata_raw: metadata_score,
             phrase_boost,
+            symbol_specificity_boost,
             weights,
         };
 
@@ -1113,7 +1238,7 @@ fn format_score_breakdown(score: &ScoreBreakdown) -> String {
     let metadata_contrib = score.metadata_raw * score.weights.metadata;
 
     format!(
-        "Intent: {}\nProfile: {}\nScore breakdown:\n- Vector: raw {:.3} * weight {:.2} = {:.3}\n- Lexical: raw {:.3} * weight {:.2} = {:.3}\n- Symbol: raw {:.3} * weight {:.2} = {:.3}\n- Metadata: raw {:.3} * weight {:.2} = {:.3}\n- Phrase boost: {:.3}",
+        "Intent: {}\nProfile: {}\nScore breakdown:\n- Vector: raw {:.3} * weight {:.2} = {:.3}\n- Lexical: raw {:.3} * weight {:.2} = {:.3}\n- Symbol: raw {:.3} * weight {:.2} = {:.3}\n- Metadata: raw {:.3} * weight {:.2} = {:.3}\n- Phrase boost: {:.3}\n- Symbol specificity boost: {:.3}",
         score.intent.as_str(),
         score.profile.as_str(),
         score.vector_raw,
@@ -1129,6 +1254,7 @@ fn format_score_breakdown(score: &ScoreBreakdown) -> String {
         score.weights.metadata,
         metadata_contrib,
         score.phrase_boost,
+        score.symbol_specificity_boost,
     )
 }
 
@@ -1451,8 +1577,8 @@ mod tests {
         EmbeddingCache, QueryCacheKey,
         candidate_limit_for_profile,
         parse_scope_roots_from_initialize, parse_scope_roots_from_tool_arguments,
-        rerank_chunks, QueryIntent, RankedChunk, RankingWeights, ScoreBreakdown,
-        SearchProfile,
+        rerank_chunks, split_symbol_tokens, tokenize_query, QueryIntent, RankedChunk,
+        RankingWeights, ScoreBreakdown, SearchProfile,
     };
     use crate::db::SearchResult;
     use crate::parser::content_hash_for_text;
@@ -1533,6 +1659,70 @@ mod tests {
         let ranked = rerank_chunks("auth token refresh", candidates, 2);
         assert_eq!(ranked.len(), 2);
         assert_eq!(ranked[0].chunk.file_path, "src/auth.rs");
+    }
+
+    #[test]
+    fn tokenize_query_splits_camel_case_and_filters_stop_words() {
+        let tokens = tokenize_query("HasApiTokens in User model");
+
+        assert!(tokens.iter().any(|token| token == "hasapitokens"));
+        assert!(tokens.iter().any(|token| token == "has"));
+        assert!(tokens.iter().any(|token| token == "api"));
+        assert!(tokens.iter().any(|token| token == "tokens"));
+        assert!(!tokens.iter().any(|token| token == "in"));
+    }
+
+    #[test]
+    fn split_symbol_tokens_splits_pascal_case_identifiers() {
+        let tokens = split_symbol_tokens("HasApiTokens");
+
+        assert!(tokens.iter().any(|token| token == "hasapitokens"));
+        assert!(tokens.iter().any(|token| token == "has"));
+        assert!(tokens.iter().any(|token| token == "api"));
+        assert!(tokens.iter().any(|token| token == "tokens"));
+    }
+
+    #[test]
+    fn rerank_handles_symbol_style_queries_like_has_api_tokens() {
+        let candidates = vec![
+            SearchResult {
+                chunk: Chunk {
+                    file_path: "app/models/user.php".to_string(),
+                    content: "class User extends Authenticatable {}".to_string(),
+                    start_line: 1,
+                    end_line: 30,
+                    language: "php".to_string(),
+                    symbol_name: Some("HasApiTokens".to_string()),
+                    symbol_kind: Some("trait".to_string()),
+                    signature_fragment: Some("use HasApiTokens;".to_string()),
+                    visibility: None,
+                    arity: None,
+                    doc_comment_proximity: None,
+                    content_hash: content_hash_for_text("class User extends Authenticatable {}"),
+                },
+                distance: Some(0.72),
+            },
+            SearchResult {
+                chunk: Chunk {
+                    file_path: "routes/api.php".to_string(),
+                    content: "Route::get('/user', fn() => 'ok');".to_string(),
+                    start_line: 1,
+                    end_line: 10,
+                    language: "php".to_string(),
+                    symbol_name: Some("api_routes".to_string()),
+                    symbol_kind: Some("module".to_string()),
+                    signature_fragment: None,
+                    visibility: None,
+                    arity: None,
+                    doc_comment_proximity: None,
+                    content_hash: content_hash_for_text("Route::get('/user', fn() => 'ok');"),
+                },
+                distance: Some(0.08),
+            },
+        ];
+
+        let ranked = rerank_chunks("HasApiTokens in User model", candidates, 2);
+        assert_eq!(ranked[0].chunk.file_path, "app/models/user.php");
     }
 
     #[test]
@@ -1863,6 +2053,7 @@ mod tests {
                 symbol_raw: 0.33,
                 metadata_raw: 0.50,
                 phrase_boost: 0.10,
+                symbol_specificity_boost: 0.05,
                 weights: RankingWeights {
                     vector: 0.50,
                     lexical: 0.28,

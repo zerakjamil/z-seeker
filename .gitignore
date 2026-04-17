@@ -3,6 +3,7 @@
 # Database and Secrets
 .env
 lancedb/
+.lancedb/
 data/
 
 test_db
