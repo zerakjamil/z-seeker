@@ -31,6 +31,10 @@ use crate::watcher::{FileWatcher, WatchConfig};
 #[derive(Parser)]
 #[command(name = "zseek", about = "Local Semantic Search MCP Server & CLI")]
 struct Cli {
+    /// Print resolved folders from a VS Code .code-workspace file and exit
+    #[arg(long)]
+    workspace_file_folders: Option<PathBuf>,
+
     #[command(subcommand)]
     command: Option<Commands>,
 }
@@ -160,6 +164,12 @@ async fn main() -> Result<()> {
 
     let cli = Cli::parse();
 
+    if let Some(workspace_file) = cli.workspace_file_folders.as_deref() {
+        let current_dir = env::current_dir()?;
+        print_workspace_file_folders_preview(&current_dir, workspace_file)?;
+        return Ok(());
+    }
+
     match cli.command.unwrap_or(Commands::Mcp {
         workspace_file: None,
     }) {
@@ -180,6 +190,7 @@ async fn main() -> Result<()> {
                 workspace_roots.len(),
                 format_roots(&workspace_roots)
             );
+            log_workspace_roots_for_indexing(&workspace_roots);
 
             let (provider, db) = setup_core().await?;
 
@@ -295,6 +306,36 @@ fn format_roots(roots: &[PathBuf]) -> String {
         .map(|root| root.display().to_string())
         .collect::<Vec<_>>()
         .join(", ")
+}
+
+fn format_workspace_roots_plan(roots: &[PathBuf]) -> String {
+    if roots.is_empty() {
+        return "(none)".to_string();
+    }
+
+    roots
+        .iter()
+        .enumerate()
+        .map(|(index, root)| format!("{}. {}", index + 1, root.display()))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn print_workspace_file_folders_preview(current_dir: &Path, workspace_file: &Path) -> Result<()> {
+    let workspace_roots = resolve_scope_roots(current_dir, Some(workspace_file))?;
+    println!(
+        "Workspace folders zseek will work on ({}):",
+        workspace_roots.len()
+    );
+    println!("{}", format_workspace_roots_plan(&workspace_roots));
+    Ok(())
+}
+
+fn log_workspace_roots_for_indexing(workspace_roots: &[PathBuf]) {
+    info!("Folders selected for indexing:");
+    for (index, root) in workspace_roots.iter().enumerate() {
+        info!("  {}. {}", index + 1, root.display());
+    }
 }
 
 async fn setup_core() -> Result<(Arc<CopilotProvider>, Arc<VectorDb>)> {
@@ -601,7 +642,11 @@ async fn initial_index(
         }
     }
 
-    info!("Initial indexing complete. Indexed {} files.", count);
+    info!(
+        "Initial indexing complete for root {}. Indexed {} files.",
+        dir.display(),
+        count
+    );
     Ok(())
 }
 
@@ -1305,11 +1350,13 @@ mod tests {
     use super::{
         benchmark_hit, benchmark_pack_cases, chunk_signature, duplicate_count,
         evaluate_benchmark_gates, file_content_signature, load_benchmark_cases,
+        format_workspace_roots_plan,
         ndcg_at_k_for_case, precision_at_k_for_case, reciprocal_rank_for_case, relevance_score,
         metric_trend, signed_delta, BenchmarkCase, BenchmarkGateConfig, BenchmarkReport,
     };
     use crate::db::SearchResult;
     use crate::parser::{content_hash_for_text, Chunk};
+    use std::path::PathBuf;
 
     fn sample_result(
         file_path: &str,
@@ -1503,6 +1550,24 @@ mod tests {
         let a = file_content_signature("alpha");
         let b = file_content_signature("beta");
         assert_ne!(a, b);
+    }
+
+    #[test]
+    fn format_workspace_roots_plan_enumerates_roots() {
+        let roots = vec![
+            PathBuf::from("/tmp/workspace/app"),
+            PathBuf::from("/tmp/workspace/api"),
+        ];
+
+        let rendered = format_workspace_roots_plan(&roots);
+        assert!(rendered.contains("1. /tmp/workspace/app"));
+        assert!(rendered.contains("2. /tmp/workspace/api"));
+    }
+
+    #[test]
+    fn format_workspace_roots_plan_handles_empty_input() {
+        let rendered = format_workspace_roots_plan(&[]);
+        assert_eq!(rendered, "(none)");
     }
 
     #[test]
