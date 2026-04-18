@@ -99,6 +99,12 @@ zseek watch --max-file-size 5242880
 
 # Limit the indexing to a specific number of files (default is 2000) to prevent exhausting embeddings
 zseek watch --max-file-count 2000
+
+# Self-update to the newest zseek version from GitHub
+zseek self-update
+
+# Alias for self-update
+zseek selfupdate
 ```
 
 ### Custom Ignore Rules (`.zseekignore`)

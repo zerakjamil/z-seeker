@@ -46,6 +46,9 @@ enum Commands {
     Auth,
     /// Install and register Z-Seeker to VS Code's settings automatically
     Install,
+    /// Self-update zseek to the newest version from GitHub
+    #[command(name = "self-update", visible_alias = "selfupdate")]
+    SelfUpdate,
     /// Run the MCP server (Default if no command is provided)
     Mcp {
         /// Optional VS Code .code-workspace file; all listed folders become active roots
@@ -183,6 +186,9 @@ async fn main() -> Result<()> {
             if let Err(e) = install::install_to_vscode() {
                 eprintln!("Failed to install to VS Code: {}", e);
             }
+        }
+        Commands::SelfUpdate => {
+            install::self_update()?;
         }
         Commands::Auth => {
             auth::run_auth_flow().await?;
@@ -1549,8 +1555,10 @@ mod tests {
         is_ignored_path,
         load_custom_ignore_matchers,
         ndcg_at_k_for_case, precision_at_k_for_case, reciprocal_rank_for_case, relevance_score,
-        metric_trend, signed_delta, BenchmarkCase, BenchmarkGateConfig, BenchmarkReport,
+        metric_trend, signed_delta, BenchmarkCase, BenchmarkGateConfig, BenchmarkReport, Cli,
+        Commands,
     };
+    use clap::Parser;
     use crate::db::SearchResult;
     use crate::parser::{content_hash_for_text, Chunk};
     use std::fs;
@@ -1775,6 +1783,18 @@ mod tests {
     fn format_workspace_roots_plan_handles_empty_input() {
         let rendered = format_workspace_roots_plan(&[]);
         assert_eq!(rendered, "(none)");
+    }
+
+    #[test]
+    fn cli_parses_self_update_command() {
+        let cli = Cli::parse_from(["zseek", "self-update"]);
+        assert!(matches!(cli.command, Some(Commands::SelfUpdate)));
+    }
+
+    #[test]
+    fn cli_parses_selfupdate_alias() {
+        let cli = Cli::parse_from(["zseek", "selfupdate"]);
+        assert!(matches!(cli.command, Some(Commands::SelfUpdate)));
     }
 
     #[test]

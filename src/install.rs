@@ -1,6 +1,8 @@
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+
+const SELF_UPDATE_REPO: &str = "https://github.com/zerakjamil/z-seeker";
 
 pub fn install_to_vscode() -> Result<()> {
     // Determine the VS Code user settings path
@@ -130,4 +132,91 @@ pub fn install_to_vscode() -> Result<()> {
 
     println!("✅ Z-Seeker successfully installed to VS Code! Please 'Reload Window' in VS Code.");
     Ok(())
+}
+
+fn infer_install_root(current_exe: &Path) -> Option<PathBuf> {
+    let bin_dir = current_exe.parent()?;
+    if bin_dir.file_name().and_then(|name| name.to_str()) == Some("bin") {
+        return bin_dir.parent().map(Path::to_path_buf);
+    }
+
+    None
+}
+
+fn self_update_command_args(current_exe: &Path) -> Vec<String> {
+    let mut args = vec![
+        "install".to_string(),
+        "--git".to_string(),
+        SELF_UPDATE_REPO.to_string(),
+        "--bin".to_string(),
+        "zseek".to_string(),
+        "--force".to_string(),
+        "--locked".to_string(),
+    ];
+
+    if let Some(root) = infer_install_root(current_exe) {
+        args.push("--root".to_string());
+        args.push(root.to_string_lossy().to_string());
+    }
+
+    args
+}
+
+pub fn self_update() -> Result<()> {
+    let current_exe = std::env::current_exe().context("Failed to resolve current executable path")?;
+    let cargo_bin = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_string());
+    let args = self_update_command_args(&current_exe);
+
+    println!("Updating zseek to the newest version from {}...", SELF_UPDATE_REPO);
+
+    let status = std::process::Command::new(&cargo_bin)
+        .args(&args)
+        .status()
+        .with_context(|| format!("Failed to execute '{}' for self-update", cargo_bin))?;
+
+    if !status.success() {
+        return Err(anyhow!(
+            "Self-update failed. Please re-run with logs: {} {}",
+            cargo_bin,
+            args.join(" ")
+        ));
+    }
+
+    println!("✅ zseek updated successfully.");
+    println!("Installed executable path: {}", current_exe.display());
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{infer_install_root, self_update_command_args, SELF_UPDATE_REPO};
+    use std::path::{Path, PathBuf};
+
+    #[test]
+    fn infer_install_root_detects_bin_layout() {
+        let root = infer_install_root(Path::new("/home/aywar/.local/bin/zseek"));
+        assert_eq!(root, Some(PathBuf::from("/home/aywar/.local")));
+    }
+
+    #[test]
+    fn infer_install_root_returns_none_outside_bin_layout() {
+        let root = infer_install_root(Path::new("/opt/zseek/zseek"));
+        assert!(root.is_none());
+    }
+
+    #[test]
+    fn self_update_args_include_repo_and_root_when_available() {
+        let args = self_update_command_args(Path::new("/home/aywar/.local/bin/zseek"));
+
+        assert!(args.contains(&"--git".to_string()));
+        assert!(args.contains(&SELF_UPDATE_REPO.to_string()));
+        assert!(args.contains(&"--root".to_string()));
+        assert!(args.contains(&"/home/aywar/.local".to_string()));
+    }
+
+    #[test]
+    fn self_update_args_skip_root_when_layout_is_unknown() {
+        let args = self_update_command_args(Path::new("/opt/zseek/zseek"));
+        assert!(!args.contains(&"--root".to_string()));
+    }
 }
