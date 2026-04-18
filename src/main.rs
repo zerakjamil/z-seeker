@@ -11,6 +11,7 @@ mod watcher;
 use anyhow::{anyhow, Result};
 use clap::{Parser, Subcommand};
 use dotenv::dotenv;
+use ignore::gitignore::{Gitignore, GitignoreBuilder};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::env;
@@ -151,6 +152,11 @@ struct BenchmarkReport {
     avg_top_distance: Option<f32>,
 }
 
+struct WorkspaceIgnoreMatcher {
+    root: PathBuf,
+    matcher: Gitignore,
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     // Load .env definitions
@@ -191,6 +197,7 @@ async fn main() -> Result<()> {
                 format_roots(&workspace_roots)
             );
             log_workspace_roots_for_indexing(&workspace_roots);
+            let ignore_matchers = Arc::new(load_custom_ignore_matchers(&workspace_roots));
 
             let (provider, db) = setup_core().await?;
             let config = WatchConfig::default();
@@ -199,6 +206,7 @@ async fn main() -> Result<()> {
             let startup_provider = provider.clone();
             let startup_db = db.clone();
             let startup_config = config.clone();
+            let startup_ignore_matchers = ignore_matchers.clone();
             tokio::spawn(async move {
                 info!(
                     "Starting background initial indexing for MCP (up to {} files per root, size limit {} bytes)...",
@@ -208,7 +216,14 @@ async fn main() -> Result<()> {
                 for root in &startup_roots {
                     info!("Initial indexing root: {}", root.display());
                     if let Err(err) =
-                        initial_index(root, &startup_provider, &startup_db, &startup_config).await
+                        initial_index(
+                            root,
+                            &startup_provider,
+                            &startup_db,
+                            &startup_config,
+                            startup_ignore_matchers.as_ref(),
+                        )
+                        .await
                     {
                         error!(
                             "Initial indexing failed for root {}: {}",
@@ -227,7 +242,13 @@ async fn main() -> Result<()> {
             for root in &workspace_roots {
                 _watchers.push(FileWatcher::new(root, tx.clone(), config.clone())?);
             }
-            start_background_processor(provider.clone(), db.clone(), rx, config);
+            start_background_processor(
+                provider.clone(),
+                db.clone(),
+                rx,
+                config,
+                ignore_matchers,
+            );
 
             // Start MCP STDIO server
             info!("MCP server ready; accepting requests while indexing continues in background.");
@@ -248,6 +269,7 @@ async fn main() -> Result<()> {
                 format_roots(&workspace_roots)
             );
             log_workspace_roots_for_indexing(&workspace_roots);
+            let ignore_matchers = Arc::new(load_custom_ignore_matchers(&workspace_roots));
 
             let (provider, db) = setup_core().await?;
 
@@ -264,7 +286,7 @@ async fn main() -> Result<()> {
             );
             for root in &workspace_roots {
                 info!("Initial indexing root: {}", root.display());
-                initial_index(root, &provider, &db, &config).await?;
+                initial_index(root, &provider, &db, &config, ignore_matchers.as_ref()).await?;
             }
 
             let (tx, rx) = mpsc::channel(100);
@@ -273,7 +295,13 @@ async fn main() -> Result<()> {
                 _watchers.push(FileWatcher::new(root, tx.clone(), config.clone())?);
             }
 
-            start_background_processor(provider.clone(), db.clone(), rx, config);
+            start_background_processor(
+                provider.clone(),
+                db.clone(),
+                rx,
+                config,
+                ignore_matchers,
+            );
 
             // Block forever on the watcher
             info!("Watching for file changes. Press Ctrl+C to exit.");
@@ -396,6 +424,46 @@ fn is_ignored_path(path: &std::path::Path) -> bool {
         "out",
         ".next",
         ".lancedb",
+        ".expo",
+        ".expo-shared",
+        ".turbo",
+        ".vercel",
+        ".cache",
+        ".parcel-cache",
+        ".pnpm-store",
+        ".yarn",
+        ".npm",
+        "coverage",
+        ".nyc_output",
+        "__pycache__",
+        ".pytest_cache",
+        ".mypy_cache",
+        ".ruff_cache",
+        ".tox",
+        ".venv",
+        "venv",
+        "env",
+    ];
+
+    let ignored_file_names = [
+        "package-lock.json",
+        "yarn.lock",
+        "pnpm-lock.yaml",
+        "bun.lockb",
+        "composer.lock",
+        "poetry.lock",
+        "pdm.lock",
+        "Pipfile.lock",
+        "npm-debug.log",
+        "yarn-error.log",
+        "pnpm-debug.log",
+    ];
+
+    let ignored_path_fragments = [
+        "/storage/logs/",
+        "/storage/framework/",
+        "/bootstrap/cache/",
+        "/public/build/",
     ];
 
     for comp in path.components() {
@@ -405,6 +473,102 @@ fn is_ignored_path(path: &std::path::Path) -> bool {
             }
         }
     }
+
+    if let Some(file_name) = path.file_name().and_then(|name| name.to_str()) {
+        if ignored_file_names.contains(&file_name) {
+            return true;
+        }
+    }
+
+    if let Some(ext) = path.extension().and_then(|ext| ext.to_str()) {
+        let ext = ext.to_ascii_lowercase();
+        if matches!(ext.as_str(), "log" | "tmp" | "pyc" | "pyo" | "pyd") {
+            return true;
+        }
+    }
+
+    let normalized = path.to_string_lossy().replace('\\', "/");
+    let normalized = format!("/{}/", normalized.trim_matches('/'));
+    for fragment in ignored_path_fragments {
+        if normalized.contains(fragment) {
+            return true;
+        }
+    }
+
+    false
+}
+
+fn load_custom_ignore_matchers(workspace_roots: &[PathBuf]) -> Vec<WorkspaceIgnoreMatcher> {
+    let mut matchers = Vec::new();
+
+    for root in workspace_roots {
+        let ignore_file = root.join(".zseekignore");
+        if !ignore_file.is_file() {
+            continue;
+        }
+
+        let mut builder = GitignoreBuilder::new(root);
+        if let Some(err) = builder.add(&ignore_file) {
+            warn!(
+                "Failed reading custom ignore file {}: {}",
+                ignore_file.display(),
+                err
+            );
+            continue;
+        }
+
+        match builder.build() {
+            Ok(matcher) => {
+                info!("Loaded custom ignore file: {}", ignore_file.display());
+                matchers.push(WorkspaceIgnoreMatcher {
+                    root: root.clone(),
+                    matcher,
+                });
+            }
+            Err(err) => {
+                warn!(
+                    "Failed parsing custom ignore file {}: {}",
+                    ignore_file.display(),
+                    err
+                );
+            }
+        }
+    }
+
+    matchers
+}
+
+fn is_ignored_path_with_matchers(path: &Path, matchers: &[WorkspaceIgnoreMatcher]) -> bool {
+    if is_ignored_path(path) {
+        return true;
+    }
+
+    let canonical = path.canonicalize().ok();
+    let is_dir = path.is_dir();
+
+    for matcher in matchers {
+        let mut relative = None;
+
+        if let Ok(value) = path.strip_prefix(&matcher.root) {
+            relative = Some(value);
+        }
+
+        if relative.is_none() {
+            if let Some(canonical_path) = canonical.as_ref() {
+                if let Ok(value) = canonical_path.strip_prefix(&matcher.root) {
+                    relative = Some(value);
+                }
+            }
+        }
+
+        if let Some(relative_path) = relative {
+            let matched = matcher.matcher.matched(relative_path, is_dir);
+            if matched.is_ignore() {
+                return true;
+            }
+        }
+    }
+
     false
 }
 
@@ -413,6 +577,7 @@ fn start_background_processor(
     db: Arc<VectorDb>,
     mut rx: mpsc::Receiver<notify::Event>,
     config: WatchConfig,
+    ignore_matchers: Arc<Vec<WorkspaceIgnoreMatcher>>,
 ) {
     tokio::spawn(async move {
         let mut parser = CodeParser::new();
@@ -420,7 +585,7 @@ fn start_background_processor(
 
         while let Some(event) = rx.recv().await {
             for path in event.paths {
-                if is_ignored_path(&path) {
+                if is_ignored_path_with_matchers(&path, ignore_matchers.as_ref()) {
                     continue;
                 }
 
@@ -560,6 +725,7 @@ async fn initial_index(
     provider: &Arc<CopilotProvider>,
     db: &Arc<VectorDb>,
     config: &WatchConfig,
+    ignore_matchers: &[WorkspaceIgnoreMatcher],
 ) -> Result<()> {
     // Implement an initial walking of the directory and indexing using `ignore`
     use ignore::WalkBuilder;
@@ -581,7 +747,7 @@ async fn initial_index(
         };
 
         let path = entry.path();
-        if !path.is_file() || is_ignored_path(path) {
+        if !path.is_file() || is_ignored_path_with_matchers(path, ignore_matchers) {
             continue;
         }
 
@@ -1379,12 +1545,25 @@ mod tests {
         benchmark_hit, benchmark_pack_cases, chunk_signature, duplicate_count,
         evaluate_benchmark_gates, file_content_signature, load_benchmark_cases,
         format_workspace_roots_plan,
+        is_ignored_path_with_matchers,
+        is_ignored_path,
+        load_custom_ignore_matchers,
         ndcg_at_k_for_case, precision_at_k_for_case, reciprocal_rank_for_case, relevance_score,
         metric_trend, signed_delta, BenchmarkCase, BenchmarkGateConfig, BenchmarkReport,
     };
     use crate::db::SearchResult;
     use crate::parser::{content_hash_for_text, Chunk};
-    use std::path::PathBuf;
+    use std::fs;
+    use std::path::{Path, PathBuf};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn unique_temp_dir(prefix: &str) -> PathBuf {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        std::env::temp_dir().join(format!("{}-{}-{}", prefix, std::process::id(), suffix))
+    }
 
     fn sample_result(
         file_path: &str,
@@ -1596,6 +1775,89 @@ mod tests {
     fn format_workspace_roots_plan_handles_empty_input() {
         let rendered = format_workspace_roots_plan(&[]);
         assert_eq!(rendered, "(none)");
+    }
+
+    #[test]
+    fn ignore_rules_skip_log_files() {
+        assert!(is_ignored_path(Path::new("storage/logs/laravel.log")));
+    }
+
+    #[test]
+    fn ignore_rules_skip_javascript_framework_artifacts() {
+        assert!(is_ignored_path(Path::new("apps/mobile/.expo/devices.json")));
+        assert!(is_ignored_path(Path::new("apps/web/.next/cache/data.bin")));
+        assert!(is_ignored_path(Path::new("apps/web/node_modules/react/index.js")));
+    }
+
+    #[test]
+    fn ignore_rules_skip_laravel_runtime_artifacts() {
+        assert!(is_ignored_path(Path::new("storage/framework/cache/data/meta")));
+        assert!(is_ignored_path(Path::new("bootstrap/cache/services.php")));
+    }
+
+    #[test]
+    fn ignore_rules_skip_python_runtime_artifacts() {
+        assert!(is_ignored_path(Path::new(".venv/lib/python3.11/site.py")));
+        assert!(is_ignored_path(Path::new(
+            "src/__pycache__/app.cpython-311.pyc"
+        )));
+    }
+
+    #[test]
+    fn ignore_rules_keep_source_files_indexable() {
+        assert!(!is_ignored_path(Path::new("src/main.rs")));
+        assert!(!is_ignored_path(Path::new("app/Http/Controllers/UserController.php")));
+    }
+
+    #[test]
+    fn custom_ignore_file_skips_configured_patterns() {
+        let root = unique_temp_dir("zseek-custom-ignore");
+        let src_dir = root.join("src");
+        let logs_dir = root.join("logs");
+        fs::create_dir_all(&src_dir).expect("create src dir");
+        fs::create_dir_all(&logs_dir).expect("create logs dir");
+
+        fs::write(root.join(".zseekignore"), "*.generated.ts\nlogs/**\n")
+            .expect("write .zseekignore");
+
+        let generated_file = src_dir.join("schema.generated.ts");
+        let logs_file = logs_dir.join("worker.txt");
+        let kept_file = src_dir.join("app.ts");
+
+        fs::write(&generated_file, "export const schema = {};\n").expect("write generated file");
+        fs::write(&logs_file, "runtime log\n").expect("write logs file");
+        fs::write(&kept_file, "export const app = {};\n").expect("write source file");
+
+        let matchers = load_custom_ignore_matchers(&[root.clone()]);
+        assert!(is_ignored_path_with_matchers(&generated_file, &matchers));
+        assert!(is_ignored_path_with_matchers(&logs_file, &matchers));
+        assert!(!is_ignored_path_with_matchers(&kept_file, &matchers));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn custom_ignore_file_is_scoped_per_workspace_root() {
+        let root_a = unique_temp_dir("zseek-ignore-scope-a");
+        let root_b = unique_temp_dir("zseek-ignore-scope-b");
+        let tmp_a = root_a.join("tmp");
+        let tmp_b = root_b.join("tmp");
+        fs::create_dir_all(&tmp_a).expect("create tmp in root a");
+        fs::create_dir_all(&tmp_b).expect("create tmp in root b");
+
+        fs::write(root_a.join(".zseekignore"), "tmp/**\n").expect("write root a ignore file");
+
+        let ignored_in_a = tmp_a.join("cache.data");
+        let kept_in_b = tmp_b.join("cache.data");
+        fs::write(&ignored_in_a, "a\n").expect("write file in root a");
+        fs::write(&kept_in_b, "b\n").expect("write file in root b");
+
+        let matchers = load_custom_ignore_matchers(&[root_a.clone(), root_b.clone()]);
+        assert!(is_ignored_path_with_matchers(&ignored_in_a, &matchers));
+        assert!(!is_ignored_path_with_matchers(&kept_in_b, &matchers));
+
+        let _ = fs::remove_dir_all(&root_a);
+        let _ = fs::remove_dir_all(&root_b);
     }
 
     #[test]

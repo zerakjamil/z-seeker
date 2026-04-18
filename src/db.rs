@@ -8,12 +8,15 @@ use arrow_array::{
 use arrow_schema::{DataType, Field, Schema as ArrowSchema};
 use futures::StreamExt;
 use lancedb::{connect, Table};
+use std::path::PathBuf;
 use std::sync::Arc;
-use tracing::info;
+use tracing::{info, warn};
 
 use lancedb::query::{ExecutableQuery, QueryBase};
 pub struct VectorDb {
-    table: Table,
+    db_root: PathBuf,
+    table_name: String,
+    connection_uri: String,
 }
 
 #[derive(Debug, Clone)]
@@ -22,52 +25,166 @@ pub struct SearchResult {
     pub distance: Option<f32>,
 }
 
-impl VectorDb {
-    pub async fn new(uri: &str) -> Result<Self> {
-        let conn = connect(uri).execute().await?;
-
-        let schema = Arc::new(ArrowSchema::new(vec![
-            Field::new("file_path", DataType::Utf8, false),
-            Field::new("content", DataType::Utf8, false),
-            Field::new("start_line", DataType::Int32, false),
-            Field::new("end_line", DataType::Int32, false),
-            Field::new("language", DataType::Utf8, false),
-            Field::new("symbol_name", DataType::Utf8, true),
-            Field::new("symbol_kind", DataType::Utf8, true),
-            Field::new("signature_fragment", DataType::Utf8, true),
-            Field::new("visibility", DataType::Utf8, true),
-            Field::new("arity", DataType::Int32, true),
-            Field::new("doc_comment_proximity", DataType::Int32, true),
-            Field::new("content_hash", DataType::Utf8, false),
-            Field::new(
-                "vector",
-                DataType::FixedSizeList(
-                    Arc::new(Field::new("item", DataType::Float32, true)),
-                    1536,
-                ),
-                false,
-            ),
-        ]));
-
-        let table_name = "semantic_chunks";
-        let table = match conn.open_table(table_name).execute().await {
-            Ok(t) => t,
-            Err(_) => {
-                info!("Creating LanceDB table '{}' at {}", table_name, uri);
-                conn.create_empty_table(table_name, schema)
-                    .execute()
-                    .await?
+fn db_root_from_uri(uri: &str) -> PathBuf {
+    let trimmed = uri.trim();
+    if let Some(file_path) = trimmed.strip_prefix("file://") {
+        #[cfg(windows)]
+        {
+            let mut decoded = file_path.replace("%20", " ");
+            if decoded.starts_with('/')
+                && decoded.len() > 2
+                && decoded.as_bytes().get(2) == Some(&b':')
+            {
+                decoded.remove(0);
             }
-        };
+            return PathBuf::from(decoded);
+        }
 
-        Ok(Self { table })
+        #[cfg(not(windows))]
+        {
+            return PathBuf::from(file_path.replace("%20", " "));
+        }
     }
 
-    pub async fn add_chunks(&self, data: Vec<(Chunk, Vec<f32>)>) -> Result<()> {
-        if data.is_empty() {
-            return Ok(());
+    PathBuf::from(trimmed)
+}
+
+fn lancedb_connection_uri(db_root: &PathBuf) -> String {
+    let rendered = db_root.to_string_lossy();
+    rendered.into_owned()
+}
+
+fn semantic_chunks_schema() -> Arc<ArrowSchema> {
+    Arc::new(ArrowSchema::new(vec![
+        Field::new("file_path", DataType::Utf8, false),
+        Field::new("content", DataType::Utf8, false),
+        Field::new("start_line", DataType::Int32, false),
+        Field::new("end_line", DataType::Int32, false),
+        Field::new("language", DataType::Utf8, false),
+        Field::new("symbol_name", DataType::Utf8, true),
+        Field::new("symbol_kind", DataType::Utf8, true),
+        Field::new("signature_fragment", DataType::Utf8, true),
+        Field::new("visibility", DataType::Utf8, true),
+        Field::new("arity", DataType::Int32, true),
+        Field::new("doc_comment_proximity", DataType::Int32, true),
+        Field::new("content_hash", DataType::Utf8, false),
+        Field::new(
+            "vector",
+            DataType::FixedSizeList(
+                Arc::new(Field::new("item", DataType::Float32, true)),
+                1536,
+            ),
+            false,
+        ),
+    ]))
+}
+
+fn is_lancedb_not_found_error(error: &anyhow::Error) -> bool {
+    let message = error.to_string().to_ascii_lowercase();
+    let has_not_found_marker = message.contains("not found")
+        || message.contains("no such file or directory")
+        || message.contains("dataset at path");
+    let has_lancedb_context = message.contains("semantic_chunks.lance")
+        || message.contains("_versions")
+        || message.contains("lance");
+
+    has_not_found_marker && has_lancedb_context
+}
+
+impl VectorDb {
+    pub async fn new(uri: &str) -> Result<Self> {
+        let db_root = db_root_from_uri(uri);
+        tokio::fs::create_dir_all(&db_root).await?;
+
+        let connection_uri = lancedb_connection_uri(&db_root);
+
+        let db = Self {
+            db_root,
+            table_name: "semantic_chunks".to_string(),
+            connection_uri,
+        };
+
+        db.open_or_create_table().await?;
+        db.ensure_versions_dir().await?;
+
+        Ok(db)
+    }
+
+    fn table_versions_dir(&self) -> PathBuf {
+        self.db_root
+            .join(format!("{}.lance", self.table_name))
+            .join("_versions")
+    }
+
+    async fn ensure_versions_dir(&self) -> Result<()> {
+        let versions_dir = self.table_versions_dir();
+        if tokio::fs::metadata(&versions_dir).await.is_err() {
+            tokio::fs::create_dir_all(&versions_dir).await?;
+            info!(
+                "Created missing LanceDB metadata directory: {}",
+                versions_dir.display()
+            );
         }
-        let schema = self.table.schema().await?;
+
+        Ok(())
+    }
+
+    async fn open_or_create_table(&self) -> Result<Table> {
+        let conn = connect(&self.connection_uri).execute().await?;
+
+        match conn.open_table(&self.table_name).execute().await {
+            Ok(table) => Ok(table),
+            Err(open_error) => {
+                warn!(
+                    "Failed opening LanceDB table '{}'; attempting create. Error: {}",
+                    self.table_name,
+                    open_error
+                );
+
+                info!(
+                    "Creating LanceDB table '{}' at {}",
+                    self.table_name,
+                    self.connection_uri
+                );
+                match conn
+                    .create_empty_table(&self.table_name, semantic_chunks_schema())
+                    .execute()
+                    .await
+                {
+                    Ok(table) => Ok(table),
+                    Err(create_error) => {
+                        warn!(
+                            "Failed creating LanceDB table '{}'; recreating table directory. Error: {}",
+                            self.table_name,
+                            create_error
+                        );
+                        self.recreate_table().await
+                    }
+                }
+            }
+        }
+    }
+
+    async fn recreate_table(&self) -> Result<Table> {
+        let table_dir = self.db_root.join(format!("{}.lance", self.table_name));
+        if tokio::fs::metadata(&table_dir).await.is_ok() {
+            let _ = tokio::fs::remove_dir_all(&table_dir).await;
+        }
+
+        let conn = connect(&self.connection_uri).execute().await?;
+        let table = conn
+            .create_empty_table(&self.table_name, semantic_chunks_schema())
+            .execute()
+            .await?;
+
+        self.ensure_versions_dir().await?;
+        Ok(table)
+    }
+
+    async fn add_chunks_inner(&self, data: &[(Chunk, Vec<f32>)]) -> Result<()> {
+        self.ensure_versions_dir().await?;
+        let table = self.open_or_create_table().await?;
+        let schema = table.schema().await?;
         let has_core_metadata_columns = schema.index_of("language").is_ok()
             && schema.index_of("symbol_name").is_ok()
             && schema.index_of("symbol_kind").is_ok()
@@ -93,19 +210,19 @@ impl VectorDb {
         let mut vectors = Vec::with_capacity(data.len());
 
         for (chunk, embedding) in data {
-            file_paths.push(chunk.file_path);
-            contents.push(chunk.content);
+            file_paths.push(chunk.file_path.clone());
+            contents.push(chunk.content.clone());
             start_lines.push(chunk.start_line as i32);
             end_lines.push(chunk.end_line as i32);
-            languages.push(chunk.language);
-            symbol_names.push(chunk.symbol_name);
-            symbol_kinds.push(chunk.symbol_kind);
-            signature_fragments.push(chunk.signature_fragment);
-            visibilities.push(chunk.visibility);
+            languages.push(chunk.language.clone());
+            symbol_names.push(chunk.symbol_name.clone());
+            symbol_kinds.push(chunk.symbol_kind.clone());
+            signature_fragments.push(chunk.signature_fragment.clone());
+            visibilities.push(chunk.visibility.clone());
             arities.push(chunk.arity);
             doc_comment_proximities.push(chunk.doc_comment_proximity);
-            content_hashes.push(chunk.content_hash);
-            vectors.push(Some(embedding.into_iter().map(Some).collect::<Vec<_>>()));
+            content_hashes.push(chunk.content_hash.clone());
+            vectors.push(Some(embedding.iter().copied().map(Some).collect::<Vec<_>>()));
         }
 
         let file_path_array = StringArray::from(file_paths);
@@ -172,8 +289,29 @@ impl VectorDb {
 
         let batches = vec![Ok(batch)];
         let iter = RecordBatchIterator::new(batches.into_iter(), schema.clone());
-        self.table.add(iter).execute().await?;
+        table.add(iter).execute().await?;
         Ok(())
+    }
+
+    pub async fn add_chunks(&self, data: Vec<(Chunk, Vec<f32>)>) -> Result<()> {
+        if data.is_empty() {
+            return Ok(());
+        }
+        match self.add_chunks_inner(&data).await {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                if !is_lancedb_not_found_error(&error) {
+                    return Err(error);
+                }
+
+                warn!(
+                    "Detected missing LanceDB table metadata while adding chunks; recreating table and retrying. Error: {}",
+                    error
+                );
+                self.recreate_table().await?;
+                self.add_chunks_inner(&data).await
+            }
+        }
     }
 
     pub async fn replace_file_chunks(
@@ -181,9 +319,22 @@ impl VectorDb {
         file_path: &str,
         data: Vec<(Chunk, Vec<f32>)>,
     ) -> Result<()> {
+        self.ensure_versions_dir().await?;
+        let table = self.open_or_create_table().await?;
         let escaped_file_path = file_path.replace('\'', "''");
         let predicate = format!("file_path = '{}'", escaped_file_path);
-        self.table.delete(&predicate).await?;
+        if let Err(error) = table.delete(&predicate).await {
+            let error = anyhow!(error);
+            if is_lancedb_not_found_error(&error) {
+                warn!(
+                    "Detected missing LanceDB table metadata while deleting file chunks; recreating table before continue. Error: {}",
+                    error
+                );
+                self.recreate_table().await?;
+            } else {
+                return Err(error);
+            }
+        }
 
         if data.is_empty() {
             return Ok(());
@@ -193,87 +344,7 @@ impl VectorDb {
     }
 
     pub async fn add_chunk(&self, chunk: Chunk, embedding: Vec<f32>) -> Result<()> {
-        let schema = self.table.schema().await?;
-        let has_core_metadata_columns = schema.index_of("language").is_ok()
-            && schema.index_of("symbol_name").is_ok()
-            && schema.index_of("symbol_kind").is_ok()
-            && schema.index_of("content_hash").is_ok();
-        let has_extended_metadata_columns = has_core_metadata_columns
-            && schema.index_of("signature_fragment").is_ok()
-            && schema.index_of("visibility").is_ok()
-            && schema.index_of("arity").is_ok()
-            && schema.index_of("doc_comment_proximity").is_ok();
-
-        let file_path_array = StringArray::from(vec![chunk.file_path.clone()]);
-        let content_array = StringArray::from(vec![chunk.content.clone()]);
-        let start_line_array = Int32Array::from(vec![chunk.start_line as i32]);
-        let end_line_array = Int32Array::from(vec![chunk.end_line as i32]);
-        let language_array = StringArray::from(vec![chunk.language.clone()]);
-        let symbol_name_array = StringArray::from(vec![chunk.symbol_name.clone()]);
-        let symbol_kind_array = StringArray::from(vec![chunk.symbol_kind.clone()]);
-        let signature_fragment_array = StringArray::from(vec![chunk.signature_fragment.clone()]);
-        let visibility_array = StringArray::from(vec![chunk.visibility.clone()]);
-        let arity_array = Int32Array::from(vec![chunk.arity]);
-        let doc_comment_proximity_array = Int32Array::from(vec![chunk.doc_comment_proximity]);
-        let content_hash_array = StringArray::from(vec![chunk.content_hash.clone()]);
-
-        let vector_array = FixedSizeListArray::from_iter_primitive::<Float32Type, _, _>(
-            vec![Some(embedding.into_iter().map(Some).collect::<Vec<_>>())],
-            1536,
-        );
-
-        let batch = if has_extended_metadata_columns {
-            RecordBatch::try_new(
-                schema.clone(),
-                vec![
-                    Arc::new(file_path_array) as Arc<dyn arrow_array::Array>,
-                    Arc::new(content_array) as Arc<dyn arrow_array::Array>,
-                    Arc::new(start_line_array) as Arc<dyn arrow_array::Array>,
-                    Arc::new(end_line_array) as Arc<dyn arrow_array::Array>,
-                    Arc::new(language_array) as Arc<dyn arrow_array::Array>,
-                    Arc::new(symbol_name_array) as Arc<dyn arrow_array::Array>,
-                    Arc::new(symbol_kind_array) as Arc<dyn arrow_array::Array>,
-                    Arc::new(signature_fragment_array) as Arc<dyn arrow_array::Array>,
-                    Arc::new(visibility_array) as Arc<dyn arrow_array::Array>,
-                    Arc::new(arity_array) as Arc<dyn arrow_array::Array>,
-                    Arc::new(doc_comment_proximity_array) as Arc<dyn arrow_array::Array>,
-                    Arc::new(content_hash_array) as Arc<dyn arrow_array::Array>,
-                    Arc::new(vector_array) as Arc<dyn arrow_array::Array>,
-                ],
-            )?
-        } else if has_core_metadata_columns {
-            RecordBatch::try_new(
-                schema.clone(),
-                vec![
-                    Arc::new(file_path_array) as Arc<dyn arrow_array::Array>,
-                    Arc::new(content_array) as Arc<dyn arrow_array::Array>,
-                    Arc::new(start_line_array) as Arc<dyn arrow_array::Array>,
-                    Arc::new(end_line_array) as Arc<dyn arrow_array::Array>,
-                    Arc::new(language_array) as Arc<dyn arrow_array::Array>,
-                    Arc::new(symbol_name_array) as Arc<dyn arrow_array::Array>,
-                    Arc::new(symbol_kind_array) as Arc<dyn arrow_array::Array>,
-                    Arc::new(content_hash_array) as Arc<dyn arrow_array::Array>,
-                    Arc::new(vector_array) as Arc<dyn arrow_array::Array>,
-                ],
-            )?
-        } else {
-            RecordBatch::try_new(
-                schema.clone(),
-                vec![
-                    Arc::new(file_path_array) as Arc<dyn arrow_array::Array>,
-                    Arc::new(content_array) as Arc<dyn arrow_array::Array>,
-                    Arc::new(start_line_array) as Arc<dyn arrow_array::Array>,
-                    Arc::new(end_line_array) as Arc<dyn arrow_array::Array>,
-                    Arc::new(vector_array) as Arc<dyn arrow_array::Array>,
-                ],
-            )?
-        };
-
-        // LanceDB 0.14 IntoArrow is implemented for RecordBatchIterator directly
-        let batches = vec![Ok(batch)];
-        let iter = RecordBatchIterator::new(batches.into_iter(), schema.clone());
-        self.table.add(iter).execute().await?;
-        Ok(())
+        self.add_chunks(vec![(chunk, embedding)]).await
     }
 
     pub async fn search(
@@ -282,8 +353,8 @@ impl VectorDb {
         limit_count: usize,
     ) -> Result<Vec<SearchResult>> {
         let qs = query_embedding.as_slice();
-        let mut results = self
-            .table
+        let table = self.open_or_create_table().await?;
+        let mut results = table
             .query()
             .nearest_to(qs)?
             .limit(limit_count)
@@ -582,6 +653,67 @@ mod tests {
             results
                 .iter()
                 .all(|result| result.chunk.file_path != file_path)
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn add_chunks_recovers_when_versions_directory_is_missing() -> Result<()> {
+        let db_dir = unique_temp_dir("zseek-db-recover-versions");
+        let db = VectorDb::new(db_dir.to_string_lossy().as_ref()).await?;
+
+        let first_file = "/tmp/project/src/first.rs";
+        let second_file = "/tmp/project/src/second.rs";
+        let first_chunk = sample_chunk(first_file, "fn first() {}", 1, 3);
+        db.add_chunks(vec![(first_chunk, vec![0.11; 1536])]).await?;
+
+        let versions_dir = db_dir.join("semantic_chunks.lance").join("_versions");
+        if versions_dir.exists() {
+            fs::remove_dir_all(&versions_dir)?;
+        }
+
+        let second_chunk = sample_chunk(second_file, "fn second() {}", 10, 14);
+        db.add_chunks(vec![(second_chunk, vec![0.22; 1536])]).await?;
+
+        let results = db.search(vec![0.22; 1536], 20).await?;
+        assert!(
+            results
+                .iter()
+                .any(|result| result.chunk.file_path == second_file)
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn new_recovers_when_versions_directory_is_missing_before_startup() -> Result<()> {
+        let db_dir = unique_temp_dir("zseek-db-startup-recover-versions");
+        let first_db = VectorDb::new(db_dir.to_string_lossy().as_ref()).await?;
+
+        let first_file = "/tmp/project/src/bootstrap.rs";
+        let first_chunk = sample_chunk(first_file, "fn bootstrap() {}", 1, 3);
+        first_db.add_chunks(vec![(first_chunk, vec![0.15; 1536])]).await?;
+
+        let versions_dir = db_dir.join("semantic_chunks.lance").join("_versions");
+        if versions_dir.exists() {
+            fs::remove_dir_all(&versions_dir)?;
+        }
+
+        drop(first_db);
+
+        let recovered_db = VectorDb::new(db_dir.to_string_lossy().as_ref()).await?;
+        let second_file = "/tmp/project/src/recovered.rs";
+        let second_chunk = sample_chunk(second_file, "fn recovered() {}", 10, 14);
+        recovered_db
+            .add_chunks(vec![(second_chunk, vec![0.25; 1536])])
+            .await?;
+
+        let results = recovered_db.search(vec![0.25; 1536], 20).await?;
+        assert!(
+            results
+                .iter()
+                .any(|result| result.chunk.file_path == second_file)
         );
 
         Ok(())

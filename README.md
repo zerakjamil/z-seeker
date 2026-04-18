@@ -1,7 +1,7 @@
 <div align="center">
   <img src="assets/zseeker-logo.png" alt="Z-Seeker Logo" width="280"/>
   
-  <h1>🚀 Z-Seeker</h1>
+  <h1>🚀 Z-Seek</h1>
   
   <p><strong>A blistering fast, local Model Context Protocol (MCP) server that provides semantic search capabilities over your codebase.</strong></p>
 
@@ -20,16 +20,16 @@ It actively watches your workspace files, parses them using `tree-sitter`, gener
 
 ### Side-by-side Comparison
 
-See the difference in context awareness when giving an AI standard file access vs enabling semantic reasoning powered by `z-seeker`:
+See the difference in context awareness when giving an AI standard file access vs enabling semantic reasoning powered by `z-seek`:
 
 <table>
   <tr>
-    <th width="50%">Before Z-Seeker (No Context)</th>
-    <th width="50%">After Z-Seeker (Semantic Search via MCP)</th>
+    <th width="50%">Before Z-Seek (No Context)</th>
+    <th width="50%">After Z-Seek (Semantic Search via MCP)</th>
   </tr>
   <tr>
-    <td><img src="assets/before-zseeker.png" alt="Before Z-Seeker - Hallucinated response or fallback" width="100%"/></td>
-    <td><img src="assets/after-zseeker.png" alt="After Z-Seeker - Exact method references and instant codebase understanding" width="100%"/></td>
+    <td><img src="assets/before-zseeker.png" alt="Before Z-Seek - Hallucinated response or fallback" width="100%"/></td>
+    <td><img src="assets/after-zseeker.png" alt="After Z-Seek - Exact method references and instant codebase understanding" width="100%"/></td>
   </tr>
 </table>
 
@@ -40,10 +40,10 @@ See the difference in context awareness when giving an AI standard file access v
 
 ## Token Efficiency & Usage Rates
 
-Z-Seeker is designed to be **hyper-efficient** with your GitHub Copilot quota:
-- **No Chat Overload**: Z-Seeker uses AST-aware parsing (`tree-sitter`) to return *only* the specific structs and functions relevant to your query.
-- **Cheap Embeddings**: Indexing your files relies on the `embeddings` endpoint, which is orders of magnitude faster and cheaper than standard chat token generation. Once a file is indexed, it is cached locally in LanceDB. Z-Seeker only reaches out for a new embedding if you **save** an active modification to a file. 
-- **Zero-Waste Queries**: When you ask a question, Z-Seeker only performs inference on your 1-sentence question to match it against your local database!
+Z-Seek is designed to be **hyper-efficient** with your GitHub Copilot quota:
+- **No Chat Overload**: Z-Seek uses AST-aware parsing (`tree-sitter`) to return *only* the specific structs and functions relevant to your query.
+- **Cheap Embeddings**: Indexing your files relies on the `embeddings` endpoint, which is orders of magnitude faster and cheaper than standard chat token generation. Once a file is indexed, it is cached locally in LanceDB. Z-Seek only reaches out for a new embedding if you **save** an active modification to a file. 
+- **Zero-Waste Queries**: When you ask a question, Z-Seek only performs inference on your 1-sentence question to match it against your local database!
 
 ---
 
@@ -74,7 +74,7 @@ Z-Seeker is designed to be **hyper-efficient** with your GitHub Copilot quota:
 
 ## ⌨️ CLI Usage
 
-Z-Seeker comes with a built-in CLI to manually manage background syncing and index configuration. It functions seamlessly as your personal, unlimited semantic grep tool.
+Z-Seek comes with a built-in CLI to manually manage background syncing and index configuration. It functions seamlessly as your personal, unlimited semantic grep tool.
 
 Install it globally using `cargo install`:
 
@@ -101,6 +101,26 @@ zseek watch --max-file-size 5242880
 zseek watch --max-file-count 2000
 ```
 
+### Custom Ignore Rules (`.zseekignore`)
+
+Z-Seek now supports a per-workspace ignore file named `.zseekignore`.
+If this file exists in an active workspace root, its patterns are applied during initial indexing and live watcher updates.
+
+Pattern syntax follows gitignore-style rules, for example:
+
+```gitignore
+# Skip generated clients
+*.generated.ts
+
+# Skip runtime artifacts
+logs/**
+.expo/**
+.next/**
+storage/framework/**
+```
+
+This is additive to Z-Seek's built-in skip list (`node_modules`, `.venv`, `.next`, `.expo`, lockfiles, `.log`, etc.).
+
 ## 🔌 Hooking it up to an MCP Client
 
 Because this server implements the Model Context Protocol over standard input/output (STDIO), you can configure your AI assistant to spawn it as a child process.
@@ -112,7 +132,7 @@ If you are using GitHub Copilot inside VS Code, you can dramatically simplify in
 zseek install
 ```
 
-This will automatically find your VS Code `settings.json` and map the Z-Seeker executable into your MCP ecosystem.
+This will automatically find your VS Code `settings.json` and map the Z-Seek executable into your MCP ecosystem.
 
 Alternatively, you can add it manually mapping this into your VS Code Settings (JSON):
 
