@@ -112,6 +112,13 @@ zseek selfupdate
 Z-Seek now supports a per-workspace ignore file named `.zseekignore`.
 If this file exists in an active workspace root, its patterns are applied during initial indexing and live watcher updates.
 
+How it works:
+
+- Scope: `.zseekignore` only controls what Z-Seek indexes. It does not change your Git tracking rules.
+- Syntax: gitignore-style patterns (`*`, `**`, folder prefixes, etc.).
+- Workspace-local: each workspace root can have its own `.zseekignore`.
+- Real-time: rules are applied in both initial indexing and watch mode updates.
+
 Pattern syntax follows gitignore-style rules, for example:
 
 ```gitignore
@@ -126,6 +133,19 @@ storage/framework/**
 ```
 
 This is additive to Z-Seek's built-in skip list (`node_modules`, `.venv`, `.next`, `.expo`, lockfiles, `.log`, etc.).
+
+### Git Commit Noise Prevention
+
+Z-Seek stores vectors in `.lancedb/`. To avoid these files flooding Source Control:
+
+- Z-Seek automatically adds `.lancedb/` to your local Git excludes at `.git/info/exclude` for each workspace root when running `mcp` or `watch`.
+- This is local-only (not committed), so your teammates are unaffected.
+
+If you want team-wide behavior, add this to your repository `.gitignore`:
+
+```gitignore
+.lancedb/
+```
 
 ## 🔌 Hooking it up to an MCP Client
 
