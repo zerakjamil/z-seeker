@@ -11,13 +11,15 @@ use crate::db::{SearchResult, VectorDb};
 use crate::parser::Chunk;
 use crate::provider::github::CopilotProvider;
 
-const MAX_CHUNK_RESPONSE_CHARS: usize = 3000;
+const MAX_CHUNK_RESPONSE_CHARS_FULL: usize = 900;
+const MAX_CHUNK_RESPONSE_CHARS_PREVIEW: usize = 260;
 const RERANK_MULTIPLIER: usize = 4;
 const MAX_VECTOR_CANDIDATES: usize = 40;
-const DEFAULT_SEARCH_LIMIT: usize = 5;
-const PROFILE_DEFAULT_LIMIT_PRECISION: usize = 4;
+const MAX_SCOPE_RESCUE_VECTOR_CANDIDATES: usize = 120;
+const DEFAULT_SEARCH_LIMIT: usize = 3;
+const PROFILE_DEFAULT_LIMIT_PRECISION: usize = 2;
 const PROFILE_DEFAULT_LIMIT_EXPLORATION: usize = DEFAULT_SEARCH_LIMIT;
-const PROFILE_DEFAULT_LIMIT_RECALL: usize = 7;
+const PROFILE_DEFAULT_LIMIT_RECALL: usize = 4;
 const PROFILE_RERANK_MULTIPLIER_PRECISION: usize = 3;
 const PROFILE_RERANK_MULTIPLIER_EXPLORATION: usize = RERANK_MULTIPLIER;
 const PROFILE_RERANK_MULTIPLIER_RECALL: usize = 6;
@@ -104,6 +106,21 @@ impl SearchProfile {
             SearchProfile::PrecisionFirst => "precision-first",
             SearchProfile::RecallFirst => "recall-first",
             SearchProfile::Exploration => "exploration",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ResponseMode {
+    Preview,
+    Full,
+}
+
+impl ResponseMode {
+    fn as_str(self) -> &'static str {
+        match self {
+            ResponseMode::Preview => "preview",
+            ResponseMode::Full => "full",
         }
     }
 }
@@ -295,6 +312,47 @@ fn adjust_weights_for_profile(base: RankingWeights, profile: SearchProfile) -> R
 fn ranking_weights_for_intent_profile(intent: QueryIntent, profile: SearchProfile) -> RankingWeights {
     let base = ranking_weights_for_intent(intent);
     adjust_weights_for_profile(base, profile)
+}
+
+fn max_distance_for_intent_profile(intent: QueryIntent, profile: SearchProfile) -> f32 {
+    match profile {
+        SearchProfile::PrecisionFirst => match intent {
+            QueryIntent::SymbolLookup => 0.85,
+            QueryIntent::UsageLookup => 0.90,
+            QueryIntent::ArchitectureLookup => 1.00,
+            QueryIntent::Exploratory => 0.95,
+        },
+        SearchProfile::Exploration => match intent {
+            QueryIntent::SymbolLookup => 1.05,
+            QueryIntent::UsageLookup => 1.10,
+            QueryIntent::ArchitectureLookup => 1.20,
+            QueryIntent::Exploratory => 1.15,
+        },
+        SearchProfile::RecallFirst => 1.35,
+    }
+}
+
+fn passes_distance_gate(
+    distance: Option<f32>,
+    max_distance: f32,
+    lexical_score: f32,
+    symbol_score: f32,
+    metadata_score: f32,
+) -> bool {
+    let Some(distance) = distance else {
+        return true;
+    };
+
+    if !distance.is_finite() {
+        return true;
+    }
+
+    if distance <= max_distance {
+        return true;
+    }
+
+    // Keep obviously relevant lexical/symbol hits even when vector distance is weak.
+    lexical_score >= 0.55 || symbol_score >= 0.55 || metadata_score >= 0.70
 }
 
 fn contains_any_phrase(query: &str, phrases: &[&str]) -> bool {
@@ -514,6 +572,44 @@ fn build_query_terms(query: &str) -> Vec<QueryTerm> {
             QueryTerm { variants }
         })
         .collect()
+}
+
+fn build_embedding_query(query: &str) -> String {
+    let trimmed = query.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+
+    let mut seen = HashSet::new();
+    let mut enriched_terms = Vec::new();
+
+    for variant in build_query_terms(trimmed)
+        .into_iter()
+        .flat_map(|term| term.variants.into_iter())
+    {
+        if variant.len() < 2 || is_query_stop_word(&variant) {
+            continue;
+        }
+
+        if seen.insert(variant.clone()) {
+            enriched_terms.push(variant);
+        }
+
+        if enriched_terms.len() >= 10 {
+            break;
+        }
+    }
+
+    if enriched_terms.is_empty() {
+        return trimmed.to_string();
+    }
+
+    let expanded = format!("{}\nidentifiers: {}", trimmed, enriched_terms.join(" "));
+    if expanded.chars().count() > 320 {
+        trimmed.to_string()
+    } else {
+        expanded
+    }
 }
 
 fn query_term_matches_haystack(term: &QueryTerm, haystack: &str) -> bool {
@@ -803,6 +899,7 @@ fn rerank_chunks_with_profile(
     profile: SearchProfile,
 ) -> Vec<RankedChunk> {
     let intent = classify_query_intent(query);
+    let distance_gate = max_distance_for_intent_profile(intent, profile);
     let query_terms = build_query_terms(query);
     let weights = ranking_weights_for_intent_profile(intent, profile);
     let lower_query = query.to_ascii_lowercase();
@@ -848,6 +945,16 @@ fn rerank_chunks_with_profile(
         } else {
             0.0
         };
+
+        if !passes_distance_gate(
+            candidate.distance,
+            distance_gate,
+            lexical_score,
+            symbol_score,
+            metadata_score,
+        ) {
+            continue;
+        }
 
         let symbol_specificity_boost = symbol
             .as_ref()
@@ -966,6 +1073,10 @@ fn parse_result_limit_from_tool_arguments(args: &Value, profile: SearchProfile) 
 
 fn candidate_limit_for_profile(limit: usize, profile: SearchProfile) -> usize {
     (limit * rerank_multiplier_for_profile(profile)).clamp(limit, MAX_VECTOR_CANDIDATES)
+}
+
+fn scope_rescue_candidate_limit(candidate_limit: usize) -> usize {
+    (candidate_limit.saturating_mul(3)).clamp(candidate_limit, MAX_SCOPE_RESCUE_VECTOR_CANDIDATES)
 }
 
 fn line_aware_truncate(content: &str, max_chars: usize) -> String {
@@ -1224,11 +1335,55 @@ fn parse_debug_mode_from_tool_arguments(args: &Value) -> bool {
 }
 
 fn parse_search_profile_from_tool_arguments(args: &Value) -> SearchProfile {
+    parse_explicit_search_profile_from_tool_arguments(args).unwrap_or(SearchProfile::Exploration)
+}
+
+fn parse_explicit_search_profile_from_tool_arguments(args: &Value) -> Option<SearchProfile> {
     let raw = ["profile", "search_profile", "searchProfile"]
         .iter()
         .find_map(|key| args.get(*key).and_then(Value::as_str));
 
-    parse_search_profile(raw)
+    raw.map(|value| parse_search_profile(Some(value)))
+}
+
+fn resolve_search_profile_for_query(args: &Value, query: &str) -> SearchProfile {
+    if let Some(profile) = parse_explicit_search_profile_from_tool_arguments(args) {
+        return profile;
+    }
+
+    match classify_query_intent(query) {
+        QueryIntent::ArchitectureLookup => SearchProfile::Exploration,
+        _ => SearchProfile::PrecisionFirst,
+    }
+}
+
+fn parse_response_mode_from_tool_arguments(args: &Value) -> ResponseMode {
+    if ["full_context", "fullContext", "full"]
+        .iter()
+        .any(|key| args.get(*key).and_then(Value::as_bool).unwrap_or(false))
+    {
+        return ResponseMode::Full;
+    }
+
+    let raw_mode = ["response_mode", "responseMode", "mode"]
+        .iter()
+        .find_map(|key| args.get(*key).and_then(Value::as_str));
+
+    if let Some(mode) = raw_mode {
+        let normalized = mode.trim().to_ascii_lowercase().replace('_', "-");
+        if matches!(normalized.as_str(), "full" | "full-context" | "expanded") {
+            return ResponseMode::Full;
+        }
+    }
+
+    ResponseMode::Preview
+}
+
+fn max_chunk_chars_for_response_mode(mode: ResponseMode) -> usize {
+    match mode {
+        ResponseMode::Preview => MAX_CHUNK_RESPONSE_CHARS_PREVIEW,
+        ResponseMode::Full => MAX_CHUNK_RESPONSE_CHARS_FULL,
+    }
 }
 
 fn format_score_breakdown(score: &ScoreBreakdown) -> String {
@@ -1258,29 +1413,48 @@ fn format_score_breakdown(score: &ScoreBreakdown) -> String {
     )
 }
 
-fn format_ranked_chunk_text(ranked: &RankedChunk, debug_mode: bool) -> String {
-    let chunk_content = line_aware_truncate(&ranked.chunk.content, MAX_CHUNK_RESPONSE_CHARS);
+fn format_ranked_chunk_text(
+    ranked: &RankedChunk,
+    debug_mode: bool,
+    response_mode: ResponseMode,
+) -> String {
+    let chunk_content = line_aware_truncate(
+        &ranked.chunk.content,
+        max_chunk_chars_for_response_mode(response_mode),
+    );
     let symbol = ranked.symbol.as_deref().unwrap_or("(none detected)");
     let symbol_kind = ranked.symbol_kind.as_deref().unwrap_or("(unknown)");
-    let distance = ranked
-        .distance
-        .map(|d| format!("{:.4}", d))
-        .unwrap_or_else(|| "n/a".to_string());
+    let mut rendered = if debug_mode {
+        let distance = ranked
+            .distance
+            .map(|d| format!("{:.4}", d))
+            .unwrap_or_else(|| "n/a".to_string());
 
-    let mut rendered = format!(
-        "File: {}\nLines: {}-{}\nLanguage: {}\nSymbol: {} ({})\nVector distance: {}\nRelevance: {} ({:.2}, matched terms: {})\nCode:\n{}",
-        ranked.chunk.file_path,
-        ranked.chunk.start_line,
-        ranked.chunk.end_line,
-        ranked.language,
-        symbol,
-        symbol_kind,
-        distance,
-        confidence_label(ranked.score),
-        ranked.score,
-        ranked.matched_terms,
-        chunk_content
-    );
+        format!(
+            "File: {}\nLines: {}-{}\nLanguage: {}\nSymbol: {} ({})\nVector distance: {}\nRelevance: {} ({:.2}, matched terms: {})\nCode:\n{}",
+            ranked.chunk.file_path,
+            ranked.chunk.start_line,
+            ranked.chunk.end_line,
+            ranked.language,
+            symbol,
+            symbol_kind,
+            distance,
+            confidence_label(ranked.score),
+            ranked.score,
+            ranked.matched_terms,
+            chunk_content
+        )
+    } else {
+        format!(
+            "File: {}\nLines: {}-{}\nSymbol: {} ({})\nCode:\n{}",
+            ranked.chunk.file_path,
+            ranked.chunk.start_line,
+            ranked.chunk.end_line,
+            symbol,
+            symbol_kind,
+            chunk_content
+        )
+    };
 
     if debug_mode {
         rendered.push_str("\n\n");
@@ -1296,14 +1470,22 @@ fn format_debug_search_summary(
     scoped_candidates: usize,
     scope_roots: &[PathBuf],
     profile: SearchProfile,
+    response_mode: ResponseMode,
     limit: usize,
     candidate_limit: usize,
+    scope_rescue_attempted: bool,
 ) -> String {
     format!(
-        "\n\nDebug summary:\n- Search profile: {}\n- Effective limit: {}\n- Candidate fetch size: {}\n- Embedding cache: {}\n- Vector candidates: {}\n- In-scope candidates: {}\n- Active scope roots: {}",
+        "\n\nDebug summary:\n- Search profile: {}\n- Response mode: {}\n- Effective limit: {}\n- Candidate fetch size: {}\n- Scope rescue retrieval: {}\n- Embedding cache: {}\n- Vector candidates: {}\n- In-scope candidates: {}\n- Active scope roots: {}",
         profile.as_str(),
+        response_mode.as_str(),
         limit,
         candidate_limit,
+        if scope_rescue_attempted {
+            "attempted"
+        } else {
+            "not-needed"
+        },
         if cache_hit { "hit" } else { "miss" },
         total_candidates,
         scoped_candidates,
@@ -1374,7 +1556,7 @@ impl McpServer {
                                             },
                                             "limit": {
                                                 "type": "number",
-                                                "description": "Maximum number of results to return. Keep this low (1-5) to save context tokens! Max is 10. Defaults by profile: precision-first=4, exploration=5, recall-first=7."
+                                                "description": "Maximum number of results to return. Keep this low (1-5) to save context tokens! Max is 10. Defaults by profile: precision-first=2, exploration=3, recall-first=4."
                                             },
                                             "scope_roots": {
                                                 "type": "array",
@@ -1386,6 +1568,14 @@ impl McpServer {
                                             "profile": {
                                                 "type": "string",
                                                 "description": "Optional ranking profile. Supported values: precision-first, recall-first, exploration. Defaults to exploration."
+                                            },
+                                            "full_context": {
+                                                "type": "boolean",
+                                                "description": "Optional. When true, return expanded code snippets. Default is compact preview snippets to reduce token usage."
+                                            },
+                                            "response_mode": {
+                                                "type": "string",
+                                                "description": "Optional. Supported values: preview (default), full."
                                             },
                                             "debug": {
                                                 "type": "boolean",
@@ -1405,17 +1595,19 @@ impl McpServer {
                                         let scope_roots =
                                             parse_scope_roots_from_tool_arguments(args, &active_scope_roots);
                                         let debug_mode = parse_debug_mode_from_tool_arguments(args);
-                                        let profile = parse_search_profile_from_tool_arguments(args);
+                                        let profile = resolve_search_profile_for_query(args, query);
+                                        let response_mode = parse_response_mode_from_tool_arguments(args);
                                         let limit = parse_result_limit_from_tool_arguments(args, profile);
                                         let candidate_limit = candidate_limit_for_profile(limit, profile);
                                         let cache_key = QueryCacheKey::from(query, &scope_roots);
+                                        let embedding_query = build_embedding_query(query);
 
                                         // 1. Get embedding for the search query
                                         let (embedding_result, cache_hit) =
                                             if let Some(cached_embedding) = embedding_cache.get(&cache_key) {
                                                 (Ok(cached_embedding), true)
                                             } else {
-                                                let fetched = self.provider.get_embeddings(query).await.map(|embedding| {
+                                                let fetched = self.provider.get_embeddings(&embedding_query).await.map(|embedding| {
                                                     embedding_cache.insert(cache_key, embedding.clone());
                                                     embedding
                                                 });
@@ -1425,13 +1617,36 @@ impl McpServer {
                                         match embedding_result {
                                             Ok(embedding) => {
                                                 // 2. Query LanceDB
-                                                match self.db.search(embedding, candidate_limit).await {
+                                                match self.db.search(embedding.clone(), candidate_limit).await {
                                                     Ok(results) => {
-                                                        let total_candidates = results.len();
-                                                        let scoped_results =
+                                                        let mut total_candidates = results.len();
+                                                        let mut scoped_results =
                                                             filter_results_to_scope(results, &scope_roots);
-                                                        let filtered_out =
+                                                        let mut filtered_out =
                                                             total_candidates.saturating_sub(scoped_results.len());
+                                                        let mut effective_candidate_limit = candidate_limit;
+                                                        let mut scope_rescue_attempted = false;
+
+                                                        if scoped_results.is_empty() {
+                                                            let expanded_limit =
+                                                                scope_rescue_candidate_limit(candidate_limit);
+                                                            if expanded_limit > candidate_limit {
+                                                                scope_rescue_attempted = true;
+                                                                if let Ok(expanded_results) =
+                                                                    self.db.search(embedding, expanded_limit).await
+                                                                {
+                                                                    total_candidates = expanded_results.len();
+                                                                    scoped_results = filter_results_to_scope(
+                                                                        expanded_results,
+                                                                        &scope_roots,
+                                                                    );
+                                                                    filtered_out = total_candidates
+                                                                        .saturating_sub(scoped_results.len());
+                                                                    effective_candidate_limit = expanded_limit;
+                                                                }
+                                                            }
+                                                        }
+
                                                         let ranked_results =
                                                             rerank_chunks_with_profile(
                                                                 query,
@@ -1465,8 +1680,10 @@ impl McpServer {
                                                                                     total_candidates.saturating_sub(filtered_out),
                                                                                     &scope_roots,
                                                                                     profile,
+                                                                                    response_mode,
                                                                                     limit,
-                                                                                    candidate_limit,
+                                                                                    effective_candidate_limit,
+                                                                                    scope_rescue_attempted,
                                                                                 )
                                                                             } else {
                                                                                 String::new()
@@ -1478,7 +1695,11 @@ impl McpServer {
                                                         } else {
                                                             let mut content_texts = Vec::new();
                                                             for ranked in &ranked_results {
-                                                                content_texts.push(format_ranked_chunk_text(ranked, debug_mode));
+                                                                content_texts.push(format_ranked_chunk_text(
+                                                                    ranked,
+                                                                    debug_mode,
+                                                                    response_mode,
+                                                                ));
                                                             }
 
                                                             let low_confidence_hint = ranked_results
@@ -1489,14 +1710,23 @@ impl McpServer {
                                                                 })
                                                                 .unwrap_or("");
 
+                                                            let preview_hint = if !debug_mode
+                                                                && response_mode == ResponseMode::Preview
+                                                            {
+                                                                "\n\nTip: Re-run semantic_search with `full_context: true` for expanded snippets."
+                                                            } else {
+                                                                ""
+                                                            };
+
                                                             serde_json::json!({
                                                                 "content": [
                                                                     {
                                                                         "type": "text",
                                                                         "text": format!(
-                                                                            "{}{}{}",
+                                                                            "{}{}{}{}",
                                                                             content_texts.join("\n\n---\n\n"),
                                                                             low_confidence_hint,
+                                                                            preview_hint,
                                                                             if debug_mode {
                                                                                 format_debug_search_summary(
                                                                                     cache_hit,
@@ -1504,12 +1734,14 @@ impl McpServer {
                                                                                     total_candidates.saturating_sub(filtered_out),
                                                                                     &scope_roots,
                                                                                     profile,
+                                                                                    response_mode,
                                                                                     limit,
-                                                                                    candidate_limit,
+                                                                                    effective_candidate_limit,
+                                                                                    scope_rescue_attempted,
                                                                                 )
                                                                             } else {
                                                                                 String::new()
-                                                                            }
+                                                                            },
                                                                         )
                                                                     }
                                                                 ]
@@ -1572,13 +1804,14 @@ mod tests {
         classify_query_intent, detect_symbol_name, distance_to_vector_score,
         filter_results_to_scope, is_path_in_scope, line_aware_truncate,
         format_ranked_chunk_text, parse_debug_mode_from_tool_arguments,
-        parse_result_limit_from_tool_arguments,
-        parse_search_profile_from_tool_arguments, rerank_chunks_with_profile,
+        parse_result_limit_from_tool_arguments, parse_response_mode_from_tool_arguments,
+        parse_search_profile_from_tool_arguments, resolve_search_profile_for_query,
+        rerank_chunks_with_profile,
         EmbeddingCache, QueryCacheKey,
-        candidate_limit_for_profile,
+        candidate_limit_for_profile, scope_rescue_candidate_limit,
         parse_scope_roots_from_initialize, parse_scope_roots_from_tool_arguments,
         rerank_chunks, split_symbol_tokens, tokenize_query, QueryIntent, RankedChunk,
-        RankingWeights, ScoreBreakdown, SearchProfile,
+        RankingWeights, ResponseMode, ScoreBreakdown, SearchProfile,
     };
     use crate::db::SearchResult;
     use crate::parser::content_hash_for_text;
@@ -1910,20 +2143,56 @@ mod tests {
     }
 
     #[test]
+    fn resolve_search_profile_defaults_to_precision_for_non_architecture_queries() {
+        let args = json!({ "query": "find auth token" });
+        let profile = resolve_search_profile_for_query(&args, "find auth token");
+        assert_eq!(profile, SearchProfile::PrecisionFirst);
+    }
+
+    #[test]
+    fn resolve_search_profile_defaults_to_exploration_for_architecture_queries() {
+        let args = json!({ "query": "architecture overview for auth pipeline" });
+        let profile = resolve_search_profile_for_query(&args, "architecture overview for auth pipeline");
+        assert_eq!(profile, SearchProfile::Exploration);
+    }
+
+    #[test]
+    fn parse_response_mode_defaults_to_preview_and_accepts_full_context() {
+        assert_eq!(
+            parse_response_mode_from_tool_arguments(&json!({ "query": "auth" })),
+            ResponseMode::Preview
+        );
+        assert_eq!(
+            parse_response_mode_from_tool_arguments(&json!({ "full_context": true })),
+            ResponseMode::Full
+        );
+        assert_eq!(
+            parse_response_mode_from_tool_arguments(&json!({ "response_mode": "full" })),
+            ResponseMode::Full
+        );
+    }
+
+    #[test]
     fn result_limit_defaults_follow_profile_when_not_provided() {
         let no_limit_args = json!({ "query": "auth token" });
         assert_eq!(
             parse_result_limit_from_tool_arguments(&no_limit_args, SearchProfile::PrecisionFirst),
-            4
+            2
         );
         assert_eq!(
             parse_result_limit_from_tool_arguments(&no_limit_args, SearchProfile::Exploration),
-            5
+            3
         );
         assert_eq!(
             parse_result_limit_from_tool_arguments(&no_limit_args, SearchProfile::RecallFirst),
-            7
+            4
         );
+    }
+
+    #[test]
+    fn scope_rescue_candidate_limit_expands_and_clamps() {
+        assert_eq!(scope_rescue_candidate_limit(12), 36);
+        assert_eq!(scope_rescue_candidate_limit(40), 120);
     }
 
     #[test]
@@ -2022,9 +2291,15 @@ mod tests {
 
     #[test]
     fn ranked_chunk_formatter_includes_score_breakdown_only_in_debug_mode() {
+        // Content longer than MAX_CHUNK_RESPONSE_CHARS_PREVIEW (260) so Preview truncates
+        // while Full (900) does not, making normal_full.len() > normal_preview.len() provable.
+        let long_content = "fn semantic_search() {\n".to_string()
+            + &"    // padding line to exceed the 260-char preview limit for testing purposes\n"
+                .repeat(4)
+            + "}";
         let chunk = Chunk {
             file_path: "src/mcp.rs".to_string(),
-            content: "fn semantic_search() {}".to_string(),
+            content: long_content.clone(),
             start_line: 42,
             end_line: 43,
             language: "rust".to_string(),
@@ -2034,7 +2309,7 @@ mod tests {
             visibility: None,
             arity: None,
             doc_comment_proximity: None,
-            content_hash: content_hash_for_text("fn semantic_search() {}"),
+            content_hash: content_hash_for_text(&long_content),
         };
 
         let ranked = RankedChunk {
@@ -2064,13 +2339,66 @@ mod tests {
             },
         };
 
-        let normal = format_ranked_chunk_text(&ranked, false);
-        assert!(!normal.contains("Score breakdown:"));
+        let normal_full = format_ranked_chunk_text(&ranked, false, ResponseMode::Full);
+        assert!(!normal_full.contains("Score breakdown:"));
 
-        let debug = format_ranked_chunk_text(&ranked, true);
+        let normal_preview = format_ranked_chunk_text(&ranked, false, ResponseMode::Preview);
+        assert!(normal_full.len() > normal_preview.len());
+
+        let debug = format_ranked_chunk_text(&ranked, true, ResponseMode::Full);
         assert!(debug.contains("Score breakdown:"));
         assert!(debug.contains("Intent: exploratory"));
         assert!(debug.contains("Profile: exploration"));
+    }
+
+    #[test]
+    fn precision_profile_distance_gate_filters_far_weak_matches() {
+        let candidates = vec![
+            SearchResult {
+                chunk: Chunk {
+                    file_path: "src/close.rs".to_string(),
+                    content: "auth token refresh logic".to_string(),
+                    start_line: 1,
+                    end_line: 4,
+                    language: "rust".to_string(),
+                    symbol_name: Some("refresh_auth_token".to_string()),
+                    symbol_kind: Some("function".to_string()),
+                    signature_fragment: None,
+                    visibility: None,
+                    arity: None,
+                    doc_comment_proximity: None,
+                    content_hash: content_hash_for_text("auth token refresh logic"),
+                },
+                distance: Some(0.15),
+            },
+            SearchResult {
+                chunk: Chunk {
+                    file_path: "src/far.rs".to_string(),
+                    content: "random placeholder text".to_string(),
+                    start_line: 1,
+                    end_line: 4,
+                    language: "rust".to_string(),
+                    symbol_name: Some("placeholder".to_string()),
+                    symbol_kind: Some("function".to_string()),
+                    signature_fragment: None,
+                    visibility: None,
+                    arity: None,
+                    doc_comment_proximity: None,
+                    content_hash: content_hash_for_text("random placeholder text"),
+                },
+                distance: Some(2.2),
+            },
+        ];
+
+        let ranked = rerank_chunks_with_profile(
+            "auth token refresh",
+            candidates,
+            2,
+            SearchProfile::PrecisionFirst,
+        );
+
+        assert_eq!(ranked.len(), 1);
+        assert_eq!(ranked[0].chunk.file_path, "src/close.rs");
     }
 
     #[test]

@@ -46,9 +46,6 @@ enum Commands {
     Auth,
     /// Install and register Z-Seeker to VS Code's settings automatically
     Install,
-    /// Self-update zseek to the newest version from GitHub
-    #[command(name = "self-update", visible_alias = "selfupdate")]
-    SelfUpdate,
     /// Run the MCP server (Default if no command is provided)
     Mcp {
         /// Optional VS Code .code-workspace file; all listed folders become active roots
@@ -187,9 +184,6 @@ async fn main() -> Result<()> {
                 eprintln!("Failed to install to VS Code: {}", e);
             }
         }
-        Commands::SelfUpdate => {
-            install::self_update()?;
-        }
         Commands::Auth => {
             auth::run_auth_flow().await?;
         }
@@ -203,7 +197,6 @@ async fn main() -> Result<()> {
                 format_roots(&workspace_roots)
             );
             log_workspace_roots_for_indexing(&workspace_roots);
-            ensure_workspace_git_local_excludes(&workspace_roots);
             let ignore_matchers = Arc::new(load_custom_ignore_matchers(&workspace_roots));
 
             let (provider, db) = setup_core().await?;
@@ -276,7 +269,6 @@ async fn main() -> Result<()> {
                 format_roots(&workspace_roots)
             );
             log_workspace_roots_for_indexing(&workspace_roots);
-            ensure_workspace_git_local_excludes(&workspace_roots);
             let ignore_matchers = Arc::new(load_custom_ignore_matchers(&workspace_roots));
 
             let (provider, db) = setup_core().await?;
@@ -400,78 +392,6 @@ fn log_workspace_roots_for_indexing(workspace_roots: &[PathBuf]) {
     for (index, root) in workspace_roots.iter().enumerate() {
         info!("  {}. {}", index + 1, root.display());
     }
-}
-
-fn ensure_workspace_git_local_excludes(workspace_roots: &[PathBuf]) {
-    for root in workspace_roots {
-        if let Err(err) = ensure_local_git_exclude_for_workspace(root) {
-            warn!(
-                "Failed to update local git excludes for {}: {}",
-                root.display(),
-                err
-            );
-        }
-    }
-}
-
-fn resolve_git_dir_for_workspace(workspace_root: &Path) -> Option<PathBuf> {
-    let git_entry = workspace_root.join(".git");
-
-    if git_entry.is_dir() {
-        return Some(git_entry);
-    }
-
-    if !git_entry.is_file() {
-        return None;
-    }
-
-    let raw = std::fs::read_to_string(&git_entry).ok()?;
-    let first_line = raw.lines().next()?.trim();
-    let relative_git_dir = first_line.strip_prefix("gitdir:")?.trim();
-    if relative_git_dir.is_empty() {
-        return None;
-    }
-
-    let git_dir = PathBuf::from(relative_git_dir);
-    Some(if git_dir.is_absolute() {
-        git_dir
-    } else {
-        workspace_root.join(git_dir)
-    })
-}
-
-fn ensure_local_git_exclude_for_workspace(workspace_root: &Path) -> Result<()> {
-    let Some(git_dir) = resolve_git_dir_for_workspace(workspace_root) else {
-        return Ok(());
-    };
-
-    let exclude_path = git_dir.join("info").join("exclude");
-    if let Some(parent) = exclude_path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-
-    let existing = std::fs::read_to_string(&exclude_path).unwrap_or_default();
-    if existing
-        .lines()
-        .any(|line| line.trim() == ".lancedb/" || line.trim() == "/.lancedb/")
-    {
-        return Ok(());
-    }
-
-    let mut updated = existing;
-    if !updated.is_empty() && !updated.ends_with('\n') {
-        updated.push('\n');
-    }
-    updated.push_str("# zseek local index artifacts\n");
-    updated.push_str(".lancedb/\n");
-    std::fs::write(&exclude_path, updated)?;
-
-    info!(
-        "Added .lancedb/ to local git excludes: {}",
-        exclude_path.display()
-    );
-
-    Ok(())
 }
 
 async fn setup_core() -> Result<(Arc<CopilotProvider>, Arc<VectorDb>)> {
@@ -1625,16 +1545,12 @@ mod tests {
         benchmark_hit, benchmark_pack_cases, chunk_signature, duplicate_count,
         evaluate_benchmark_gates, file_content_signature, load_benchmark_cases,
         format_workspace_roots_plan,
-        ensure_local_git_exclude_for_workspace,
         is_ignored_path_with_matchers,
         is_ignored_path,
         load_custom_ignore_matchers,
-        resolve_git_dir_for_workspace,
         ndcg_at_k_for_case, precision_at_k_for_case, reciprocal_rank_for_case, relevance_score,
-        metric_trend, signed_delta, BenchmarkCase, BenchmarkGateConfig, BenchmarkReport, Cli,
-        Commands,
+        metric_trend, signed_delta, BenchmarkCase, BenchmarkGateConfig, BenchmarkReport,
     };
-    use clap::Parser;
     use crate::db::SearchResult;
     use crate::parser::{content_hash_for_text, Chunk};
     use std::fs;
@@ -1862,18 +1778,6 @@ mod tests {
     }
 
     #[test]
-    fn cli_parses_self_update_command() {
-        let cli = Cli::parse_from(["zseek", "self-update"]);
-        assert!(matches!(cli.command, Some(Commands::SelfUpdate)));
-    }
-
-    #[test]
-    fn cli_parses_selfupdate_alias() {
-        let cli = Cli::parse_from(["zseek", "selfupdate"]);
-        assert!(matches!(cli.command, Some(Commands::SelfUpdate)));
-    }
-
-    #[test]
     fn ignore_rules_skip_log_files() {
         assert!(is_ignored_path(Path::new("storage/logs/laravel.log")));
     }
@@ -1954,48 +1858,6 @@ mod tests {
 
         let _ = fs::remove_dir_all(&root_a);
         let _ = fs::remove_dir_all(&root_b);
-    }
-
-    #[test]
-    fn local_git_exclude_adds_lancedb_pattern_once() {
-        let root = unique_temp_dir("zseek-git-exclude-add");
-        let info_dir = root.join(".git").join("info");
-        fs::create_dir_all(&info_dir).expect("create .git/info");
-
-        let exclude_file = info_dir.join("exclude");
-        fs::write(&exclude_file, "# existing rules\n").expect("write exclude file");
-
-        ensure_local_git_exclude_for_workspace(&root).expect("first insert should succeed");
-        ensure_local_git_exclude_for_workspace(&root).expect("second insert should be idempotent");
-
-        let contents = fs::read_to_string(&exclude_file).expect("read exclude file");
-        let lancedb_lines = contents
-            .lines()
-            .filter(|line| line.trim() == ".lancedb/")
-            .count();
-
-        assert_eq!(lancedb_lines, 1, "should not duplicate .lancedb/ entry");
-
-        let _ = fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn resolve_git_dir_supports_gitdir_pointer_file() {
-        let root = unique_temp_dir("zseek-gitdir-pointer");
-        let gitdir = root.join(".actual-git");
-        fs::create_dir_all(gitdir.join("info")).expect("create gitdir info");
-        fs::write(root.join(".git"), "gitdir: .actual-git\n").expect("write gitdir pointer");
-
-        let resolved = resolve_git_dir_for_workspace(&root).expect("gitdir should resolve");
-        assert_eq!(resolved, gitdir);
-
-        ensure_local_git_exclude_for_workspace(&root).expect("exclude update should succeed");
-        let exclude_contents =
-            fs::read_to_string(root.join(".actual-git").join("info").join("exclude"))
-                .expect("read exclude from gitdir");
-        assert!(exclude_contents.lines().any(|line| line.trim() == ".lancedb/"));
-
-        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
