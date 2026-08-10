@@ -1,3 +1,5 @@
+
+
 <div align="center">
   <img src="assets/zseeker-logo.png" alt="Z-Seeker Logo" width="280"/>
   
@@ -35,7 +37,7 @@ See the difference in context awareness when giving an AI standard file access v
 
 - **Real-Time Indexing**: Runs a background `tokio` watcher that automatically detects file changes and re-indexes code chunks on the fly.
 - **AST-Aware Chunking**: Leverages `tree-sitter` (Rust, TypeScript/JavaScript) to smartly chunk your code by logical blocks rather than arbitrary line breaks.
-- **Local Vector Database**: Uses `LanceDB` directly on your disk (`.lancedb/`) for sub-millisecond similarity search—no external database setup required.
+- **Local Vector Database**: Uses `LanceDB` directly on your disk (`/.lancedb/`) for sub-millisecond similarity search—no external database setup required.
 - **MCP Compliant**: Communicates via standard STDIO JSON-RPC. Easily pluggable into Copilot, Cursor, Claude Desktop, and other MCP-compatible clients.
 
 ## Token Efficiency & Usage Rates
@@ -68,7 +70,7 @@ Z-Seek is designed to be **hyper-efficient** with your GitHub Copilot quota:
 3. **Authenticate:**
    You must authorize the app securely with your GitHub account so it can fetch embeddings.
    ```bash
-   ./target/release/z-seeker auth
+   ./target/release/zseek auth
    ```
    Follow the on-screen instructions to paste your code at `https://github.com/login/device`. Your token will be securely saved to `~/.copilot-mcp-token`.
 
